@@ -5,7 +5,7 @@ edition = "2021"
 description = "GLM Coding Plan quota tray monitor (5-hour window & reset time)"
 license = "MIT"
 repository = "https://github.com/crazykun/GLMeter"
-rust-version = "1.77"
+rust-version = "1.89"
 
 [dependencies]
 tray-icon = { version = "0.24", default-features = false, features = ["gtk"] }

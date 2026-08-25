@@ -26,12 +26,20 @@ static UI: OnceLock<Mutex<menu::UiState>> = OnceLock::new();
 // TrayIcon 内部使用 Rc（非 Sync），仅在主线程访问
 thread_local! {
     static TRAY: std::cell::RefCell<Option<TrayIcon>> = const { std::cell::RefCell::new(None) };
+    // 当前菜单结构指纹 + 菜单项句柄；结构不变时只做 set_text 原地更新，
+    // 避免 Linux 上 DBusMenu 反复重新注册
+    static MENU: std::cell::RefCell<Option<(menu::Shape, menu::Slots)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn main() -> tray_icon::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
         let _ = run_check(args.iter().any(|a| a == "--activate"));
+        return Ok(());
+    }
+
+    if !acquire_single_instance() {
         return Ok(());
     }
 
@@ -71,9 +79,16 @@ fn main() -> tray_icon::Result<()> {
         })
     });
 
+    let (menu0, slots0, shape0) = {
+        let guard = ui.lock().unwrap();
+        let (m, s) = menu::build(&guard);
+        (m, s, menu::shape_of(&guard))
+    };
+    MENU.with(|m| *m.borrow_mut() = Some((shape0, slots0)));
+
     let tray = TrayIconBuilder::new()
         .with_icon(load_icon())
-        .with_menu(Box::new(menu::build(&ui.lock().unwrap())))
+        .with_menu(Box::new(menu0))
         .with_tooltip("GLMeter · GLM Coding Plan 额度监控")
         .build()?;
     TRAY.with(|t| *t.borrow_mut() = Some(tray));
@@ -159,9 +174,8 @@ fn main() -> tray_icon::Result<()> {
                             }
                         }
                     };
-                    let tip = menu::tooltip(&ui);
                     drop(ui);
-                    rebuild(&tip);
+                    render();
                 }
             }
         }
@@ -172,22 +186,63 @@ fn set_busy(msg: Option<String>) {
     if let Some(ui) = UI.get() {
         let mut ui = ui.lock().unwrap();
         ui.busy = msg;
-        let tip = menu::tooltip(&ui);
         drop(ui);
-        rebuild(&tip);
+        render();
     }
 }
 
-fn rebuild(tooltip: &str) {
-    TRAY.with(|t| {
-        if let Some(tray) = t.borrow().as_ref() {
-            if let Some(ui) = UI.get() {
-                let ui = ui.lock().unwrap();
-                tray.set_menu(Some(Box::new(menu::build(&ui))));
-            }
-            let _ = tray.set_tooltip(Some(tooltip));
+/// 渲染托盘菜单与悬停提示：
+/// 结构变化 → 整体重建；否则仅 set_text 原地更新
+fn render() {
+    let Some(ui_cell) = UI.get() else { return };
+    let ui = ui_cell.lock().unwrap();
+    let shape = menu::shape_of(&ui);
+    let tip = menu::tooltip(&ui);
+
+    MENU.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let needs_rebuild = cell.as_ref().is_none_or(|(s, _)| *s != shape);
+        if needs_rebuild {
+            let (m, slots) = menu::build(&ui);
+            TRAY.with(|t| {
+                if let Some(tray) = t.borrow().as_ref() {
+                    tray.set_menu(Some(Box::new(m)));
+                }
+            });
+            *cell = Some((shape, slots));
+        }
+        if let Some((_, slots)) = cell.as_ref() {
+            menu::apply(slots, &ui);
         }
     });
+
+    TRAY.with(|t| {
+        if let Some(tray) = t.borrow().as_ref() {
+            let _ = tray.set_tooltip(Some(tip.as_str()));
+        }
+    });
+}
+
+/// 单实例锁：避免多实例同时注册托盘（DBus watcher 会拒绝重复注册）
+fn acquire_single_instance() -> bool {
+    let path = config::config_path().with_file_name("instance.lock");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::File::create(&path).and_then(|f| {
+        f.try_lock()?;
+        Ok(f)
+    }) {
+        Ok(f) => {
+            // 持锁到进程退出
+            std::mem::forget(f);
+            true
+        }
+        Err(_) => {
+            eprintln!("GLMeter 已在运行（锁文件: {}）", path.display());
+            false
+        }
+    }
 }
 
 fn load_icon() -> tray_icon::Icon {

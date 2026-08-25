@@ -51,6 +51,13 @@ cargo build --release
 sudo apt install libgtk-3-dev libayatana-appindicator3-dev
 ```
 
+### Linux 已知说明
+
+- 托盘图标通过 StatusNotifierItem(DBus) 协议注册。GLMeter 已做优化：**仅在菜单结构变化时重建菜单，常规刷新只原地更新文本**，避免 DBusMenu 反复重新注册（Deepin DDE 等桌面会报 `notifier item has been registered` 并拒绝注册）
+- 启动时若终端出现 `g_value_set_boxed` CRITICAL、`libayatana-appindicator is deprecated` 或 `Fontconfig warning`，均来自系统 C 库自身，无功能影响，可忽略
+- GLMeter 使用单实例锁（`instance.lock`），重复启动会直接退出
+- 若托盘长时间不显示，可尝试重启 dock/panel（如 Deepin 的 dde-dock）后重新运行
+
 ## 配置
 
 首次运行会生成配置模板，路径：
