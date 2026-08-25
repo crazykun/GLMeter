@@ -141,7 +141,7 @@ jobs:
           path: |
             glmeter-*.tar.gz
             glmeter-*.zip
-            glmeter-*.deb
+            glmeter*.deb
             glmeter-*.dmg
             glmeter-*-setup.exe
 
@@ -152,6 +152,6 @@ jobs:
           files: |
             glmeter-*.tar.gz
             glmeter-*.zip
-            glmeter-*.deb
+            glmeter*.deb
             glmeter-*.dmg
             glmeter-*-setup.exe
