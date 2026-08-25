@@ -30,6 +30,8 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
+    // mut 仅为 macOS set_activation_policy 所需
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     // 托盘应用不显示在 Dock 中
