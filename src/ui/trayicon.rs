@@ -181,5 +181,5 @@ fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc
     }
 
     let _ = tray.set_tooltip(Some(&tip));
-    let _ = tray.set_title(Some(&title));
+    tray.set_title(Some(&title));
 }
