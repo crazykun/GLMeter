@@ -12,6 +12,8 @@
 ## 特性
 
 - ⚡ **激活额度**：新窗口未被使用时 API 不计算 `nextResetTime`，点击菜单里的「激活额度」会发送一条最小请求（`"1"`，约 20 tokens），立即激活 5 小时窗口并显示重置时间
+- ⏰ **定时激活**（默认开启）：窗口未激活时自动激活；每到重置时间自动激活新窗口，重置倒计时永不断档
+- 📊 **进度条**：菜单与悬停提示中用块字符直观展示剩余额度
 - ↻ 定时自动刷新（默认 5 分钟，可配置），左键点击托盘立即刷新
 - 🔧 配置热加载：修改配置文件后无需重启
 - 🖥 `--check` 无界面模式，便于脚本化与调试
@@ -19,13 +21,13 @@
 ## 截图（菜单示意）
 
 ```
-GLM Coding Plan · Lite
+GLM Coding Plan · Lite 套餐
 ────────────────────────
-5小时额度: 已用 6%（剩余 94%）
-  ↻ 重置 今天 19:20（59分后）
+5小时额度 ████████░░░░ 剩余 70%
+  ↻ 重置 今天 19:20（17分后）
 ────────────────────────
-MCP 月额度: 11/100 次（已用 11%）
-  · search-prime: 4 · zread: 7
+MCP 月额度 █████████░░░ 13/100 次
+  · search-prime: 5 · zread: 7
   ↻ 重置 09-16 09:11
 ────────────────────────
 ⚡ 激活额度（发送 "1"）
@@ -44,17 +46,12 @@ cargo build --release
 
 ### Linux 依赖
 
-需要 GTK3 与 libappindicator（多数桌面发行版已内置）：
-
-```bash
-# Debian / Ubuntu
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev
-```
+**无**。Linux 后端使用 [ksni](https://crates.io/crates/ksni)（StatusNotifierItem 协议纯 Rust 实现），不依赖 GTK/libappindicator，glibc 即可运行。
 
 ### Linux 已知说明
 
-- 托盘图标通过 StatusNotifierItem(DBus) 协议注册。GLMeter 已做优化：**仅在菜单结构变化时重建菜单，常规刷新只原地更新文本**，避免 DBusMenu 反复重新注册（Deepin DDE 等桌面会报 `notifier item has been registered` 并拒绝注册）
-- 启动时若终端出现 `g_value_set_boxed` CRITICAL、`libayatana-appindicator is deprecated` 或 `Fontconfig warning`，均来自系统 C 库自身，无功能影响，可忽略
+- 托盘基于 StatusNotifierItem(DBus) 协议（ksni 纯 Rust 实现）：悬停显示详情提示，左键点击立即刷新，托盘文字由 `tray_title` 模板自定义
+- dock/panel 重启导致 watcher 离线时自动重连，无需重启 GLMeter
 - GLMeter 使用单实例锁（`instance.lock`），重复启动会直接退出
 - 若托盘长时间不显示，可尝试重启 dock/panel（如 Deepin 的 dde-dock）后重新运行
 
@@ -83,6 +80,15 @@ max_tokens = 8
 
 # 自动刷新间隔（秒），最小 60
 interval_secs = 300
+
+# 托盘显示文字模板（Linux 悬停 Title / macOS 菜单栏文字），支持变量：
+#   {level} {5h_used} {5h_left} {5h_reset} {5h_countdown}
+#   {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}
+tray_title = "GLM {5h_left}%"
+
+# 定时激活：窗口未激活时自动激活；重置时间过后自动激活新窗口
+# （每次激活消耗约 20 tokens，默认开启）
+auto_activate = true
 ```
 
 也可用环境变量 `GLM_API_KEY` / `GLM_BASE_URL` 覆盖（适合 CI / 临时使用）。

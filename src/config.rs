@@ -14,6 +14,23 @@ pub struct Config {
     pub max_tokens: u32,
     /// 自动刷新间隔（秒）
     pub interval_secs: u64,
+    /// 托盘显示文字/悬停提示模板，支持变量:
+    /// {level} {5h_used} {5h_left} {5h_reset} {5h_countdown}
+    /// {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}
+    #[serde(default = "default_tray_title")]
+    pub tray_title: String,
+    /// 定时激活：额度窗口未激活（或重置后）时，自动发送最小请求
+    /// 以触发 5h 窗口统计并获取 nextResetTime
+    #[serde(default = "default_auto_activate")]
+    pub auto_activate: bool,
+}
+
+fn default_tray_title() -> String {
+    "GLM {5h_left}%".into()
+}
+
+fn default_auto_activate() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -24,6 +41,8 @@ impl Default for Config {
             model: "glm-5.2".into(),
             max_tokens: 8,
             interval_secs: 300,
+            tray_title: default_tray_title(),
+            auto_activate: default_auto_activate(),
         }
     }
 }
