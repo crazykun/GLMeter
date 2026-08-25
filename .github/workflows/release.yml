@@ -14,8 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # musl 静态链接：不依赖目标机 glibc，任何 x86_64 Linux 可直接运行
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             name: linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -30,7 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Linux 后端为 ksni（纯 Rust StatusNotifierItem），无系统依赖
+      - name: Install Linux dependencies (musl)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Linux 后端为 ksni（纯 Rust StatusNotifierItem），无其他系统依赖
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
