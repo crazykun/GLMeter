@@ -59,12 +59,91 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../glmeter-${{ matrix.name }}.zip glmeter.exe
 
+      # ── Linux: .deb（musl 静态二进制，无运行时依赖）──────────────
+      - name: Package .deb
+        if: runner.os == 'Linux'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE=glmeter-deb
+          mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin"
+          install -m 755 target/${{ matrix.target }}/release/glmeter "$STAGE/usr/bin/glmeter"
+          cat > "$STAGE/DEBIAN/control" <<EOF
+          Package: glmeter
+          Version: $VERSION
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: crazykun <kunji@dofun.cn>
+          Homepage: https://github.com/crazykun/GLMeter
+          Description: GLM Coding Plan quota tray monitor
+           5-hour window progress bar, reset countdown, MCP monthly usage,
+           one-click & scheduled quota activation, headless --check mode.
+           Static musl binary, runs on any x86_64 Linux.
+          EOF
+          dpkg-deb --build --root-owner-group "$STAGE" "glmeter_${VERSION}_amd64.deb"
+
+      # ── macOS: .dmg（.app bundle + Applications 快捷方式）────────
+      - name: Package .dmg
+        if: runner.os == 'macOS'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP=GLMeter.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
+          cp target/${{ matrix.target }}/release/glmeter "$APP/Contents/MacOS/glmeter"
+
+          # png -> icns（iconset + iconutil）
+          mkdir icon.iconset
+          for s in 16 32 128 256; do
+            sips -z $s $s assets/icon.png --out "icon.iconset/icon_${s}x${s}.png" >/dev/null
+            sips -z $((s*2)) $((s*2)) assets/icon.png --out "icon.iconset/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>glmeter</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleIdentifier</key><string>com.crazykun.glmeter</string>
+            <key>CFBundleName</key><string>GLMeter</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSUIElement</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # 临时签名（ad-hoc）+ 打 dmg
+          codesign --force --sign - "$APP"
+          cp -R "$APP" dist/
+          ln -s /Applications dist/Applications
+          hdiutil create -volname GLMeter -srcfolder dist -format UDZO -ov "glmeter-${{ matrix.name }}.dmg"
+
+      # ── Windows: Inno Setup 安装器（runner 自带 iscc）───────────
+      - name: Package installer (.exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart('v')
+          Copy-Item "target/${{ matrix.target }}/release/glmeter.exe" packaging/
+          Copy-Item assets/icon.ico packaging/
+          Push-Location packaging
+          iscc /DVERSION="$ver" glmeter.iss
+          Pop-Location
+          Move-Item "packaging/glmeter-$ver-setup.exe" .
+
       - uses: actions/upload-artifact@v4
         with:
           name: glmeter-${{ matrix.name }}
           path: |
             glmeter-*.tar.gz
             glmeter-*.zip
+            glmeter-*.deb
+            glmeter-*.dmg
+            glmeter-*-setup.exe
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -73,3 +152,6 @@ jobs:
           files: |
             glmeter-*.tar.gz
             glmeter-*.zip
+            glmeter-*.deb
+            glmeter-*.dmg
+            glmeter-*-setup.exe
