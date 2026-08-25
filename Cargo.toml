@@ -1,0 +1,24 @@
+[package]
+name = "glmeter"
+version = "0.1.0"
+edition = "2021"
+description = "GLM Coding Plan quota tray monitor (5-hour window & reset time)"
+license = "MIT"
+repository = "https://github.com/crazykun/GLMeter"
+rust-version = "1.77"
+
+[dependencies]
+tray-icon = { version = "0.24", default-features = false, features = ["gtk"] }
+tao = "0.37"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
