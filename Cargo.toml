@@ -1,6 +1,6 @@
 [package]
 name = "glmeter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "GLM Coding Plan quota tray monitor (5-hour window & reset time)"
 license = "MIT"
