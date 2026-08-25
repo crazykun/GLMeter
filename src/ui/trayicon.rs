@@ -27,13 +27,14 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     let interval_secs = state.lock().unwrap().cfg.interval_secs;
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
-    let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    // 托盘应用不显示在 Dock 中
     #[cfg(target_os = "macos")]
     {
-        use tao::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        builder.with_activation_policy(ActivationPolicy::Accessory);
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
-    let event_loop = builder.build();
 
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
@@ -53,8 +54,9 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     }));
 
     // worker 完成网络请求后，唤醒事件循环重渲染
+    let render_proxy = event_loop.create_proxy();
     spawn_worker(cmd_rx, cmd_tx.clone(), state.clone(), move || {
-        let _ = proxy.send_event(UserEvent::Render);
+        let _ = render_proxy.send_event(UserEvent::Render);
     });
     spawn_ticker(cmd_tx.clone(), interval_secs);
 
