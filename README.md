@@ -81,6 +81,10 @@ max_tokens = 8
 # 自动刷新间隔（秒），最小 60
 interval_secs = 300
 
+# 定时刷新起始对齐时间点（"HH:MM" 本地时区），留空则从启动时刻滚动计时。
+# 例如 300 秒 + "00:00" → 每天 00:00/00:05/00:10… 整点网格刷新
+refresh_align = "00:00"
+
 # 托盘显示文字模板（Linux 悬停 Title / macOS 菜单栏文字），支持变量：
 #   {level} {5h_used} {5h_left} {5h_reset} {5h_countdown}
 #   {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}

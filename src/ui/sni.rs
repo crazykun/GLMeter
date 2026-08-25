@@ -95,7 +95,10 @@ fn escape_label(s: &str) -> String {
 }
 
 pub fn run(state: Arc<Mutex<UiState>>) {
-    let interval_secs = state.lock().unwrap().cfg.interval_secs;
+    let (interval_secs, align) = {
+        let ui = state.lock().unwrap();
+        (ui.cfg.interval_secs, ui.cfg.refresh_align.clone())
+    };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
     let tray = GlmTray {
@@ -115,7 +118,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     spawn_worker(cmd_rx, cmd_tx.clone(), state, move || {
         let _ = handle.update(|_| ());
     });
-    spawn_ticker(cmd_tx, interval_secs);
+    spawn_ticker(cmd_tx, interval_secs, align);
 
     // 主线程驻留（ksni 服务与 worker 均在各自线程）
     loop {

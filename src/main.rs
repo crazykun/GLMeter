@@ -155,14 +155,52 @@ fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
     state.lock().unwrap().busy = msg;
 }
 
-pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64) {
-    let interval = std::time::Duration::from_secs(interval_secs.max(60));
+pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64, align: Option<String>) {
+    let interval = interval_secs.max(60);
+    let align_time = align
+        .as_deref()
+        .and_then(|s| chrono::NaiveTime::parse_from_str(s, "%H:%M").ok())
+        .or_else(|| {
+            if align.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                eprintln!("[GLMeter] refresh_align 格式应为 \"HH:MM\"，忽略该配置");
+            }
+            None
+        });
     std::thread::spawn(move || loop {
-        std::thread::sleep(interval);
+        let next = match align_time {
+            Some(t) => next_aligned(t, interval, chrono::Local::now()),
+            None => chrono::Local::now() + chrono::Duration::seconds(interval as i64),
+        };
+        let wait = (next - chrono::Local::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(interval));
+        std::thread::sleep(wait);
         if cmd.send(Cmd::Fetch).is_err() {
             break;
         }
     });
+}
+
+/// 计算对齐网格上的下一个刷新时刻：
+/// 每天从 align 起每 interval 一跳，返回其中第一个 > now 的时刻
+fn next_aligned(
+    align: chrono::NaiveTime,
+    interval: u64,
+    now: chrono::DateTime<chrono::Local>,
+) -> chrono::DateTime<chrono::Local> {
+    let base_local = now
+        .date_naive()
+        .and_time(align)
+        .and_local_timezone(chrono::Local)
+        .single()
+        .unwrap_or(now);
+    let elapsed = (now - base_local).num_seconds();
+    if elapsed < 0 {
+        // 今天的对齐起始点还未到，第一次刷新就在 base 时刻
+        return base_local;
+    }
+    let jumps = elapsed / interval as i64 + 1;
+    base_local + chrono::Duration::seconds(jumps * interval as i64)
 }
 
 /// 解码内嵌图标为 RGBA
@@ -303,5 +341,46 @@ fn run_check(also_activate: bool) {
             eprintln!("查询失败: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, NaiveTime, TimeZone};
+
+    fn today_at(h: u32, m: u32, s: u32) -> chrono::DateTime<chrono::Local> {
+        let naive = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(h, m, s)
+            .unwrap();
+        chrono::Local.from_local_datetime(&naive).single().unwrap()
+    }
+
+    #[test]
+    fn aligned_grid() {
+        let align = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        let base = today_at(9, 30, 0);
+
+        // 起始点未到 → 下一次就是起始点本身
+        let now = today_at(9, 0, 0);
+        assert_eq!(next_aligned(align, 300, now), base);
+        // 起始点刚过 10 秒 → 下一次在 5 分钟网格上
+        assert_eq!(
+            next_aligned(align, 300, base + Duration::seconds(10)),
+            base + Duration::seconds(300)
+        );
+        // 恰好落在网格点上 → 下一个点（不含当前）
+        assert_eq!(
+            next_aligned(align, 300, base + Duration::seconds(300)),
+            base + Duration::seconds(600)
+        );
+        // 深夜跨天：now 已过当天起点很远 → 仍在当天网格内推进
+        let late = today_at(23, 50, 0);
+        let jumps = ((late - base).num_seconds() / 300 + 1) * 300;
+        assert_eq!(
+            next_aligned(align, 300, late),
+            base + Duration::seconds(jumps)
+        );
     }
 }

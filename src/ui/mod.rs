@@ -143,11 +143,6 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
                     v.push(MenuEntry::Info(format!("  ↻ 重置 {}", fmt_reset(&dt))));
                 }
             }
-            v.push(MenuEntry::Separator);
-            v.push(MenuEntry::Info(format!(
-                "更新于 {}",
-                s.fetched_at.format("%H:%M:%S")
-            )));
         }
     }
 
@@ -159,9 +154,14 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
         id: ID_ACTIVATE,
         text: activate_text(state).into(),
     });
+    // 上次刷新时间挂在「立即刷新」按钮上：动作与反馈在同一行
+    let refreshed_at = match &state.status {
+        Status::Ok(s) => format!("（更新于 {}）", s.fetched_at.format("%H:%M:%S")),
+        _ => String::new(),
+    };
     v.push(MenuEntry::Button {
         id: ID_REFRESH,
-        text: "↻ 立即刷新".into(),
+        text: format!("↻ 立即刷新{refreshed_at}"),
     });
     v.push(MenuEntry::Button {
         id: ID_CONFIG,

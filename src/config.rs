@@ -14,6 +14,11 @@ pub struct Config {
     pub max_tokens: u32,
     /// 自动刷新间隔（秒）
     pub interval_secs: u64,
+    /// 定时刷新的起始对齐时间点（"HH:MM"，本地时区）。
+    /// 设置后刷新时刻对齐为「每天 HH:MM 起、每 interval_secs 一跳」的网格，
+    /// 例如 00:00 + 300s → 00:00/00:05/00:10…；留空则从启动时刻滚动计时。
+    #[serde(default)]
+    pub refresh_align: Option<String>,
     /// 托盘显示文字/悬停提示模板，支持变量:
     /// {level} {5h_used} {5h_left} {5h_reset} {5h_countdown}
     /// {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}
@@ -41,6 +46,7 @@ impl Default for Config {
             model: "glm-5.2".into(),
             max_tokens: 8,
             interval_secs: 300,
+            refresh_align: None,
             tray_title: default_tray_title(),
             auto_activate: default_auto_activate(),
         }

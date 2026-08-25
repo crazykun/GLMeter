@@ -24,10 +24,13 @@ enum UserEvent {
 }
 
 pub fn run(state: Arc<Mutex<UiState>>) {
-    let interval_secs = state.lock().unwrap().cfg.interval_secs;
+    let (interval_secs, align) = {
+        let ui = state.lock().unwrap();
+        (ui.cfg.interval_secs, ui.cfg.refresh_align.clone())
+    };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     // 托盘应用不显示在 Dock 中
     #[cfg(target_os = "macos")]
@@ -58,7 +61,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     spawn_worker(cmd_rx, cmd_tx.clone(), state.clone(), move || {
         let _ = render_proxy.send_event(UserEvent::Render);
     });
-    spawn_ticker(cmd_tx.clone(), interval_secs);
+    spawn_ticker(cmd_tx.clone(), interval_secs, align);
 
     // 初次构建菜单（结构指纹 + 句柄）
     let (menu0, slots0, shape0) = {
@@ -155,6 +158,12 @@ fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc
     let entries = ui::menu_entries(&ui);
     let shape: Vec<u8> = entries.iter().map(|e| e.kind()).collect();
     let title = ui::title_text(&ui);
+    let (tip_title, tip_lines) = ui::tooltip(&ui);
+    let tip = if tip_lines.is_empty() {
+        tip_title
+    } else {
+        format!("{tip_title}\n{}", tip_lines.join("\n"))
+    };
 
     let needs_rebuild = slots.as_ref().is_none_or(|(s, _)| *s != shape);
     if needs_rebuild {
@@ -171,6 +180,6 @@ fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc
         }
     }
 
-    let _ = tray.set_tooltip(Some(&title));
+    let _ = tray.set_tooltip(Some(&tip));
     let _ = tray.set_title(Some(&title));
 }
