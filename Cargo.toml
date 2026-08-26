@@ -1,6 +1,6 @@
 [package]
 name = "glmeter"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "GLM Coding Plan quota tray monitor (5-hour window & reset time)"
 license = "MIT"
@@ -24,6 +24,10 @@ ksni = { version = "0.3", default-features = false, features = ["blocking", "asy
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.24"
 tao = "0.37"
+
+# exe 图标资源嵌入（build.rs 仅在 Windows 目标时实际生效）
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 strip = true

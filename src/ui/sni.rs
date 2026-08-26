@@ -5,7 +5,7 @@
 //! - 纯 Rust DBus，无 GTK/libappindicator 依赖
 //! - 菜单按需拉取（DBusMenu），数据刷新不会导致重复注册
 
-use super::{UiState, ID_ACTIVATE, ID_CONFIG, ID_REFRESH};
+use super::{UiState, ID_ACTIVATE, ID_CONFIG, ID_REFRESH, ID_REPO};
 use crate::ui;
 use crate::{spawn_ticker, spawn_worker, Cmd};
 use ksni::blocking::TrayMethods;
@@ -69,6 +69,7 @@ impl Tray for GlmTray {
                                 ID_ACTIVATE => Cmd::Activate,
                                 ID_REFRESH => Cmd::Fetch,
                                 ID_CONFIG => Cmd::OpenConfig,
+                                ID_REPO => Cmd::OpenRepo,
                                 _ => Cmd::Quit,
                             };
                             let _ = cmd_tx.send(cmd);
@@ -95,9 +96,13 @@ fn escape_label(s: &str) -> String {
 }
 
 pub fn run(state: Arc<Mutex<UiState>>) {
-    let (interval_secs, align) = {
+    let (interval_secs, align, activate_at) = {
         let ui = state.lock().unwrap();
-        (ui.cfg.interval_secs, ui.cfg.refresh_align.clone())
+        (
+            ui.cfg.interval_secs,
+            ui.cfg.refresh_align.clone(),
+            ui.cfg.activate_at.clone(),
+        )
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
@@ -118,7 +123,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     spawn_worker(cmd_rx, cmd_tx.clone(), state, move || {
         let _ = handle.update(|_| ());
     });
-    spawn_ticker(cmd_tx, interval_secs, align);
+    spawn_ticker(cmd_tx, interval_secs, align, activate_at);
 
     // 主线程驻留（ksni 服务与 worker 均在各自线程）
     loop {

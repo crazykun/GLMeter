@@ -12,8 +12,14 @@ pub struct Config {
     pub model: String,
     /// 激活请求的 max_tokens
     pub max_tokens: u32,
-    /// 自动刷新间隔（秒）
+    /// 自动刷新间隔（秒），最小 60
     pub interval_secs: u64,
+    /// 每天定点激活时刻（"HH:MM"，本地时区，可多个）。
+    /// 每天在这些时刻自动发送激活请求激活 5h 窗口，例如
+    /// ["09:00", "14:00"] → 每天 9 点和 14 点各激活一次；
+    /// 激活未生效时 1 分钟后自动重试（最多 3 次）；留空则不定点激活。
+    #[serde(default)]
+    pub activate_at: Vec<String>,
     /// 定时刷新的起始对齐时间点（"HH:MM"，本地时区）。
     /// 设置后刷新时刻对齐为「每天 HH:MM 起、每 interval_secs 一跳」的网格，
     /// 例如 00:00 + 300s → 00:00/00:05/00:10…；留空则从启动时刻滚动计时。
@@ -24,7 +30,7 @@ pub struct Config {
     /// {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}
     #[serde(default = "default_tray_title")]
     pub tray_title: String,
-    /// 定时激活：额度窗口未激活（或重置后）时，自动发送最小请求
+    /// 定时激活（auto 模式）：额度窗口未激活（或重置后）时，自动发送最小请求
     /// 以触发 5h 窗口统计并获取 nextResetTime
     #[serde(default = "default_auto_activate")]
     pub auto_activate: bool,
@@ -46,6 +52,7 @@ impl Default for Config {
             model: "glm-5.2".into(),
             max_tokens: 8,
             interval_secs: 300,
+            activate_at: Vec::new(),
             refresh_align: None,
             tray_title: default_tray_title(),
             auto_activate: default_auto_activate(),

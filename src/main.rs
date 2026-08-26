@@ -1,3 +1,7 @@
+//! Windows 下作为 GUI 程序运行（不弹 CMD 窗口）；
+//! `--check` 模式会重新附加父进程控制台，仍可在终端打印结果。
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod api;
 mod config;
 mod ui;
@@ -16,12 +20,15 @@ pub enum Cmd {
     Fetch,
     Activate,
     OpenConfig,
+    OpenRepo,
     Quit,
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
+        #[cfg(target_os = "windows")]
+        attach_console();
         run_check(args.iter().any(|a| a == "--activate"));
         return;
     }
@@ -50,6 +57,10 @@ pub fn spawn_worker(
             .expect("http client");
         // 已安排的自动激活目标时刻（防止重复调度）
         let mut scheduled: Option<chrono::DateTime<chrono::Local>> = None;
+        // 激活重试计数（激活后窗口仍未生效 → 1 分钟后重试，最多 3 次）
+        let mut activate_retries: u32 = 0;
+        const MAX_ACTIVATE_RETRIES: u32 = 3;
+        const RETRY_DELAY_SECS: u64 = 60;
         // 首轮查询
         let _ = cmd_tx.send(Cmd::Fetch);
         for cmd in cmd_rx {
@@ -60,21 +71,64 @@ pub fn spawn_worker(
                     schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
                 }
                 Cmd::Activate => {
-                    set_busy(&state, Some("激活中，发送最小请求…".into()));
+                    let attempt = activate_retries;
+                    set_busy(
+                        &state,
+                        Some(if attempt == 0 {
+                            "激活中，发送最小请求…".to_string()
+                        } else {
+                            format!("激活重试 {attempt}/{MAX_ACTIVATE_RETRIES}…")
+                        }),
+                    );
                     notify();
                     let cfg = config::load().0;
                     if let Err(e) = api::activate(&client, &cfg) {
                         eprintln!("[GLMeter] activate: {e}");
                     }
-                    set_busy(&state, Some("刷新配额…".into()));
+                    set_busy(&state, Some("刷新配额…".to_string()));
                     worker_fetch(&client, &state);
                     notify();
-                    schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
+
+                    let activated = {
+                        let ui = state.lock().unwrap();
+                        matches!(&ui.status, ui::Status::Ok(s) if s
+                            .five_hour()
+                            .is_some_and(|w| w.next_reset.is_some()))
+                    };
+                    if activated {
+                        activate_retries = 0;
+                        set_busy(&state, None);
+                        notify();
+                        schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
+                    } else if activate_retries < MAX_ACTIVATE_RETRIES {
+                        activate_retries += 1;
+                        set_busy(
+                            &state,
+                            Some(format!(
+                                "激活未生效，{RETRY_DELAY_SECS}秒后重试（{activate_retries}/{MAX_ACTIVATE_RETRIES}）"
+                            )),
+                        );
+                        notify();
+                        let tx = cmd_tx.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS));
+                            let _ = tx.send(Cmd::Activate);
+                        });
+                    } else {
+                        eprintln!(
+                            "[GLMeter] 激活重试 {MAX_ACTIVATE_RETRIES} 次仍未生效，等待下次触发"
+                        );
+                        activate_retries = 0;
+                        set_busy(&state, None);
+                        notify();
+                        schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
+                    }
                 }
                 Cmd::OpenConfig => {
                     let path = state.lock().unwrap().cfg_path.clone();
                     open_config(&path);
                 }
+                Cmd::OpenRepo => open_url(ui::REPO_URL),
                 Cmd::Quit => {
                     std::process::exit(0);
                 }
@@ -155,7 +209,58 @@ fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
     state.lock().unwrap().busy = msg;
 }
 
-pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64, align: Option<String>) {
+/// 调度器入口：
+/// - 周期刷新：每 interval_secs（可对齐网格）自动 Fetch
+/// - 定点激活：activate_at 每天在配置时刻自动 Activate
+pub fn spawn_ticker(
+    cmd: mpsc::Sender<Cmd>,
+    interval_secs: u64,
+    align: Option<String>,
+    activate_at: Vec<String>,
+) {
+    spawn_interval_ticker(cmd.clone(), interval_secs, align);
+    let times = parse_activate_at(&activate_at);
+    if !times.is_empty() {
+        spawn_daily_activate(cmd, &times);
+    }
+}
+
+/// "HH:MM" 列表 → NaiveTime 列表（非法条目告警后忽略）
+fn parse_activate_at(activate_at: &[String]) -> Vec<chrono::NaiveTime> {
+    activate_at
+        .iter()
+        .filter_map(|s| {
+            match chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S"))
+            {
+                Ok(t) => Some(t),
+                Err(_) => {
+                    eprintln!("[GLMeter] activate_at 条目 {s:?} 格式应为 \"HH:MM\"，已忽略");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// 每天在配置时刻触发一次激活
+fn spawn_daily_activate(cmd: mpsc::Sender<Cmd>, times: &[chrono::NaiveTime]) {
+    let times = times.to_vec();
+    std::thread::spawn(move || loop {
+        let Some(next) = next_daily(&times, chrono::Local::now()) else {
+            break;
+        };
+        let wait = (next - chrono::Local::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(60));
+        std::thread::sleep(wait);
+        if cmd.send(Cmd::Activate).is_err() {
+            break;
+        }
+    });
+}
+
+fn spawn_interval_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64, align: Option<String>) {
     let interval = interval_secs.max(60);
     let align_time = align
         .as_deref()
@@ -179,6 +284,28 @@ pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64, align: Option<St
             break;
         }
     });
+}
+
+/// 定点刷新时刻中最近的一个未来时刻：
+/// 优先取今天尚未到达的时刻，否则取明天最早的时刻
+fn next_daily(
+    times: &[chrono::NaiveTime],
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    let today = now.date_naive();
+    let tomorrow = today + chrono::Duration::days(1);
+    let at = |d: chrono::NaiveDate, t: chrono::NaiveTime| {
+        chrono::Local
+            .from_local_datetime(&d.and_time(t))
+            .single()
+            .filter(|dt| *dt > now)
+    };
+    times
+        .iter()
+        .copied()
+        .filter_map(|t| at(today, t).or_else(|| at(tomorrow, t)))
+        .min()
 }
 
 /// 计算对齐网格上的下一个刷新时刻：
@@ -252,6 +379,24 @@ pub fn open_config(path: &std::path::Path) {
     }
 }
 
+/// 用系统默认浏览器打开链接
+/// （GUI 子系统无控制台，explorer/open/xdg-open 均不弹窗）
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer 直接接 URL 会调用默认浏览器（rundll32 备选，无需额外依赖）
+        std::process::Command::new("explorer").arg(url).spawn().ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().ok();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().ok();
+    }
+}
+
 /// 单实例锁：避免多实例同时注册托盘（DBus watcher 会拒绝重复注册）
 fn acquire_single_instance() -> bool {
     let path = config::config_path().with_file_name("instance.lock");
@@ -270,6 +415,53 @@ fn acquire_single_instance() -> bool {
         Err(_) => {
             eprintln!("GLMeter 已在运行（锁文件: {}）", path.display());
             false
+        }
+    }
+}
+
+/// GUI 子系统下 `--check` 重新挂回调用方终端：
+/// AttachConsole(父进程) + 把 stdout/stderr 重定向到 CONOUT$
+#[cfg(target_os = "windows")]
+fn attach_console() {
+    use std::ffi::c_void;
+    const ATTACH_PARENT_PROCESS: usize = u32::MAX as usize;
+    const STD_OUTPUT_HANDLE: u32 = u32::MAX - 10; // -11
+    const STD_ERROR_HANDLE: u32 = u32::MAX - 11; // -12
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+
+    extern "system" {
+        fn AttachConsole(process_id: usize) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *const c_void,
+            disposition: u32,
+            flags: u32,
+            template: *const c_void,
+        ) -> *mut c_void;
+        fn SetStdHandle(id: u32, handle: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return; // 非终端启动（如双击），无输出目标
+        }
+        let conout: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        let handle = CreateFileW(
+            conout.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null(),
+        );
+        if handle as isize != -1 {
+            SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            SetStdHandle(STD_ERROR_HANDLE, handle);
         }
     }
 }
@@ -355,6 +547,39 @@ mod tests {
             .and_hms_opt(h, m, s)
             .unwrap();
         chrono::Local.from_local_datetime(&naive).single().unwrap()
+    }
+
+    #[test]
+    fn daily_times() {
+        let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let eight = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+
+        // 今天 9 点还没到 → 今天 9 点
+        let now = today_at(7, 30, 0);
+        assert_eq!(next_daily(&[nine], now).unwrap(), today_at(9, 0, 0));
+        // 已过 9 点 → 明天 9 点
+        let now = today_at(9, 0, 1);
+        let expect = today_at(9, 0, 0) + Duration::days(1);
+        assert_eq!(next_daily(&[nine], now).unwrap(), expect);
+        // 多个时刻 → 取最近的未来时刻
+        let now = today_at(8, 30, 0);
+        assert_eq!(next_daily(&[nine, eight], now).unwrap(), today_at(9, 0, 0));
+        // 恰好落在时刻点上 → 下一次是明天（不含当前）
+        let now = today_at(8, 0, 0);
+        assert_eq!(
+            next_daily(&[eight], now).unwrap(),
+            today_at(8, 0, 0) + Duration::days(1)
+        );
+        // 空列表 → 无下一次
+        assert!(next_daily(&[], chrono::Local::now()).is_none());
+    }
+
+    #[test]
+    fn parse_activate_at_entries() {
+        let ok = parse_activate_at(&["09:00".into(), " 21:30 ".into(), "09:00:05".into()]);
+        assert_eq!(ok.len(), 3);
+        let bad = parse_activate_at(&["9点".into(), "".into()]);
+        assert!(bad.is_empty());
     }
 
     #[test]

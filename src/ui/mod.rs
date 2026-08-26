@@ -18,10 +18,12 @@ pub mod trayicon;
 pub const ID_ACTIVATE: &str = "activate";
 pub const ID_REFRESH: &str = "refresh";
 pub const ID_CONFIG: &str = "config";
+pub const ID_REPO: &str = "repo";
 pub const ID_QUIT: &str = "quit";
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO: &str = "github.com/crazykun/GLMeter";
+pub const REPO_URL: &str = "https://github.com/crazykun/GLMeter";
 
 pub enum Status {
     Loading,
@@ -167,7 +169,11 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
         id: ID_CONFIG,
         text: "⚙ 打开配置文件".into(),
     });
-    v.push(MenuEntry::Info(format!("GLMeter v{VERSION} · {REPO}")));
+    v.push(MenuEntry::Button {
+        id: ID_REPO,
+        // 点击整行 → 默认浏览器打开仓库页
+        text: format!("↗ GLMeter v{VERSION} · {REPO}"),
+    });
     v.push(MenuEntry::Button {
         id: ID_QUIT,
         text: "✕ 退出".into(),

@@ -24,9 +24,13 @@ enum UserEvent {
 }
 
 pub fn run(state: Arc<Mutex<UiState>>) {
-    let (interval_secs, align) = {
+    let (interval_secs, align, activate_at) = {
         let ui = state.lock().unwrap();
-        (ui.cfg.interval_secs, ui.cfg.refresh_align.clone())
+        (
+            ui.cfg.interval_secs,
+            ui.cfg.refresh_align.clone(),
+            ui.cfg.activate_at.clone(),
+        )
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
@@ -63,7 +67,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     spawn_worker(cmd_rx, cmd_tx.clone(), state.clone(), move || {
         let _ = render_proxy.send_event(UserEvent::Render);
     });
-    spawn_ticker(cmd_tx.clone(), interval_secs, align);
+    spawn_ticker(cmd_tx.clone(), interval_secs, align, activate_at);
 
     // 初次构建菜单（结构指纹 + 句柄）
     let (menu0, slots0, shape0) = {
@@ -100,6 +104,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
                         ui::ID_ACTIVATE => Cmd::Activate,
                         ui::ID_REFRESH => Cmd::Fetch,
                         ui::ID_CONFIG => Cmd::OpenConfig,
+                        ui::ID_REPO => Cmd::OpenRepo,
                         ui::ID_QUIT => {
                             *control_flow = ControlFlow::Exit;
                             return;
