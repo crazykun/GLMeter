@@ -246,16 +246,15 @@ fn parse_activate_at(activate_at: &[String]) -> Vec<chrono::NaiveTime> {
 /// 每天在配置时刻触发一次激活
 fn spawn_daily_activate(cmd: mpsc::Sender<Cmd>, times: &[chrono::NaiveTime]) {
     let times = times.to_vec();
-    std::thread::spawn(move || loop {
-        let Some(next) = next_daily(&times, chrono::Local::now()) else {
-            break;
-        };
-        let wait = (next - chrono::Local::now())
-            .to_std()
-            .unwrap_or(std::time::Duration::from_secs(60));
-        std::thread::sleep(wait);
-        if cmd.send(Cmd::Activate).is_err() {
-            break;
+    std::thread::spawn(move || {
+        while let Some(next) = next_daily(&times, chrono::Local::now()) {
+            let wait = (next - chrono::Local::now())
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(60));
+            std::thread::sleep(wait);
+            if cmd.send(Cmd::Activate).is_err() {
+                break;
+            }
         }
     });
 }
