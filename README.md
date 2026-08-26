@@ -2,6 +2,8 @@
 
 跨平台 GLM Coding Plan 配额托盘监控工具（Windows / macOS / Linux），用 Rust 编写。
 
+![GLMeter](assets/glmeter.png)
+
 在系统托盘实时查看：
 
 - **5 小时额度**：已用 / 剩余百分比、下次重置时间及倒计时
