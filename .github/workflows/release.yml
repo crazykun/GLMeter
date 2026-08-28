@@ -59,14 +59,24 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../glmeter-${{ matrix.name }}.zip glmeter.exe
 
-      # ── Linux: .deb（musl 静态二进制，无运行时依赖）──────────────
+      # ── Linux: .deb（musl 静态二进制，含 .desktop 启动器入口 + hicolor 图标）──
       - name: Package .deb
         if: runner.os == 'Linux'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           STAGE=glmeter-deb
-          mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin"
+          mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" \
+                   "$STAGE/usr/share/applications" \
+                   "$STAGE/usr/share/icons/hicolor/32x32/apps" \
+                   "$STAGE/usr/share/icons/hicolor/128x128/apps" \
+                   "$STAGE/usr/share/icons/hicolor/256x256/apps" \
+                   "$STAGE/usr/share/doc/glmeter"
           install -m 755 target/${{ matrix.target }}/release/glmeter "$STAGE/usr/bin/glmeter"
+          install -m 644 packaging/glmeter.desktop "$STAGE/usr/share/applications/glmeter.desktop"
+          install -m 644 assets/icon32.png  "$STAGE/usr/share/icons/hicolor/32x32/apps/glmeter.png"
+          install -m 644 assets/icon128.png "$STAGE/usr/share/icons/hicolor/128x128/apps/glmeter.png"
+          install -m 644 assets/icon.png    "$STAGE/usr/share/icons/hicolor/256x256/apps/glmeter.png"
+          install -m 644 README.md "$STAGE/usr/share/doc/glmeter/README.md"
           cat > "$STAGE/DEBIAN/control" <<EOF
           Package: glmeter
           Version: $VERSION
@@ -80,6 +90,14 @@ jobs:
            one-click & scheduled quota activation, headless --check mode.
            Static musl binary, runs on any x86_64 Linux.
           EOF
+          cat > "$STAGE/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database /usr/share/applications || true
+          fi
+          EOF
+          chmod 755 "$STAGE/DEBIAN/postinst"
           dpkg-deb --build --root-owner-group "$STAGE" "glmeter_${VERSION}_amd64.deb"
 
       # ── macOS: .dmg（.app bundle + Applications 快捷方式）────────

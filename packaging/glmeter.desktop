@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GLMeter
+GenericName=GLM Quota Monitor
+Comment=GLM Coding Plan quota tray monitor (5-hour window & reset time)
+Exec=glmeter
+Icon=glmeter
+Terminal=false
+Categories=Utility;System;Monitor;
+StartupNotify=true
