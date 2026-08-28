@@ -4,3 +4,4 @@
 config.toml
 .env
 dist/
+AGENTS.md
