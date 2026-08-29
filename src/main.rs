@@ -61,6 +61,13 @@ pub fn spawn_worker(
         let mut activate_retries: u32 = 0;
         const MAX_ACTIVATE_RETRIES: u32 = 3;
         const RETRY_DELAY_SECS: u64 = 60;
+        // 整轮重试（首发 + 3 次重试）全部失败后进入指数退避冷却，
+        // 防止「未生效 → 5 秒后再激活」的无限请求循环
+        let mut failed_rounds: u32 = 0;
+        let mut cooldown_until: Option<chrono::DateTime<chrono::Local>> = None;
+        /// 退避时长：5 分钟起步、每失败一轮翻倍、封顶 1 小时
+        const ACTIVATE_BACKOFF_BASE_SECS: u64 = 300;
+        const ACTIVATE_BACKOFF_MAX_SECS: u64 = 3600;
         // 首轮查询
         let _ = cmd_tx.send(Cmd::Fetch);
         for cmd in cmd_rx {
@@ -68,7 +75,12 @@ pub fn spawn_worker(
                 Cmd::Fetch => {
                     worker_fetch(&client, &state);
                     notify();
-                    schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
+                    // 窗口已激活（服务端最终生效/用户手动激活）→ 清除退避状态
+                    if window_active(&state) {
+                        failed_rounds = 0;
+                        cooldown_until = None;
+                    }
+                    schedule_auto_activate(&cmd_tx, &state, &mut scheduled, cooldown_until);
                 }
                 Cmd::Activate => {
                     let attempt = activate_retries;
@@ -89,17 +101,13 @@ pub fn spawn_worker(
                     worker_fetch(&client, &state);
                     notify();
 
-                    let activated = {
-                        let ui = state.lock().unwrap();
-                        matches!(&ui.status, ui::Status::Ok(s) if s
-                            .five_hour()
-                            .is_some_and(|w| w.next_reset.is_some()))
-                    };
-                    if activated {
+                    if window_active(&state) {
                         activate_retries = 0;
+                        failed_rounds = 0;
+                        cooldown_until = None;
                         set_busy(&state, None);
                         notify();
-                        schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
+                        schedule_auto_activate(&cmd_tx, &state, &mut scheduled, cooldown_until);
                     } else if activate_retries < MAX_ACTIVATE_RETRIES {
                         activate_retries += 1;
                         set_busy(
@@ -115,13 +123,33 @@ pub fn spawn_worker(
                             let _ = tx.send(Cmd::Activate);
                         });
                     } else {
-                        eprintln!(
-                            "[GLMeter] 激活重试 {MAX_ACTIVATE_RETRIES} 次仍未生效，等待下次触发"
-                        );
+                        // 整轮重试失败：指数退避，到期后 Fetch 重新评估（而非直接再激活）
                         activate_retries = 0;
-                        set_busy(&state, None);
+                        failed_rounds += 1;
+                        let backoff_secs = (ACTIVATE_BACKOFF_BASE_SECS
+                            << (failed_rounds - 1).min(7))
+                        .min(ACTIVATE_BACKOFF_MAX_SECS);
+                        cooldown_until = Some(
+                            chrono::Local::now() + chrono::Duration::seconds(backoff_secs as i64),
+                        );
+                        scheduled = None;
+                        set_busy(
+                            &state,
+                            Some(format!(
+                                "激活未生效，{}分钟后自动重试（第{failed_rounds}轮退避）",
+                                backoff_secs / 60
+                            )),
+                        );
                         notify();
-                        schedule_auto_activate(&cmd_tx, &state, &mut scheduled);
+                        eprintln!(
+                            "[GLMeter] 激活重试 {MAX_ACTIVATE_RETRIES} 次仍未生效，{}分钟后重新评估",
+                            backoff_secs / 60
+                        );
+                        let tx = cmd_tx.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                            let _ = tx.send(Cmd::Fetch);
+                        });
                     }
                 }
                 Cmd::OpenConfig => {
@@ -140,13 +168,19 @@ pub fn spawn_worker(
 /// 定时激活调度：
 /// - 窗口未激活 → 5 秒后自动激活（让 nextResetTime 立即可查）
 /// - 窗口已激活 → 在重置时间过后 60 秒自动激活新窗口
+/// - 退避冷却期内不调度（由退避线程到点后 Fetch 重新评估）
 ///
 /// 由每次 Fetch/Activate 结果驱动，`scheduled` 防止对同一目标重复起线程
 fn schedule_auto_activate(
     cmd_tx: &mpsc::Sender<Cmd>,
     state: &Arc<Mutex<UiState>>,
     scheduled: &mut Option<chrono::DateTime<chrono::Local>>,
+    cooldown_until: Option<chrono::DateTime<chrono::Local>>,
 ) {
+    if cooldown_until.is_some_and(|until| until > chrono::Local::now()) {
+        *scheduled = None;
+        return;
+    }
     let (enabled, target) = {
         let ui = state.lock().unwrap();
         let five_hour = match &ui.status {
@@ -195,7 +229,7 @@ fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>)
     let cfg = config::load().0;
     let result = api::fetch_quota(client, &cfg);
     let mut ui = state.lock().unwrap();
-    ui.cfg = config::load().0;
+    ui.cfg = cfg;
     ui.busy = None;
     ui.status = match result {
         Ok(_) if !ui.cfg.configured() => ui::Status::NoKey,
@@ -205,6 +239,14 @@ fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>)
     };
 }
 
+/// 5 小时窗口是否已激活（nextResetTime 可查）
+fn window_active(state: &Arc<Mutex<UiState>>) -> bool {
+    let ui = state.lock().unwrap();
+    matches!(&ui.status, ui::Status::Ok(s) if s
+        .five_hour()
+        .is_some_and(|w| w.next_reset.is_some()))
+}
+
 fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
     state.lock().unwrap().busy = msg;
 }
@@ -212,18 +254,16 @@ fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
 /// 调度器入口：
 /// - 周期刷新：每 interval_secs（可对齐网格）自动 Fetch
 /// - 定点激活：activate_at 每天在配置时刻自动 Activate
-pub fn spawn_ticker(
-    cmd: mpsc::Sender<Cmd>,
-    interval_secs: u64,
-    align: Option<String>,
-    activate_at: Vec<String>,
-) {
-    spawn_interval_ticker(cmd.clone(), interval_secs, align);
-    let times = parse_activate_at(&activate_at);
-    if !times.is_empty() {
-        spawn_daily_activate(cmd, &times);
-    }
+///
+/// 两个线程每轮醒来都重读配置，interval_secs / refresh_align / activate_at
+/// 的改动无需重启即可生效（发现粒度约 TICKER_POLL_SECS）。
+pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>) {
+    spawn_interval_ticker(cmd.clone());
+    spawn_daily_activate(cmd);
 }
+
+/// 单次睡眠封顶：既保证定点时刻精确触发，又能及时发现配置变更
+const TICKER_POLL_SECS: u64 = 60;
 
 /// "HH:MM" 列表 → NaiveTime 列表（非法条目告警后忽略）
 fn parse_activate_at(activate_at: &[String]) -> Vec<chrono::NaiveTime> {
@@ -243,25 +283,9 @@ fn parse_activate_at(activate_at: &[String]) -> Vec<chrono::NaiveTime> {
         .collect()
 }
 
-/// 每天在配置时刻触发一次激活
-fn spawn_daily_activate(cmd: mpsc::Sender<Cmd>, times: &[chrono::NaiveTime]) {
-    let times = times.to_vec();
-    std::thread::spawn(move || {
-        while let Some(next) = next_daily(&times, chrono::Local::now()) {
-            let wait = (next - chrono::Local::now())
-                .to_std()
-                .unwrap_or(std::time::Duration::from_secs(60));
-            std::thread::sleep(wait);
-            if cmd.send(Cmd::Activate).is_err() {
-                break;
-            }
-        }
-    });
-}
-
-fn spawn_interval_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64, align: Option<String>) {
-    let interval = interval_secs.max(60);
-    let align_time = align
+/// "HH:MM" → NaiveTime；非法值告警后忽略（None → 滚动间隔模式）
+fn parse_align(align: &Option<String>) -> Option<chrono::NaiveTime> {
+    align
         .as_deref()
         .and_then(|s| chrono::NaiveTime::parse_from_str(s, "%H:%M").ok())
         .or_else(|| {
@@ -269,18 +293,76 @@ fn spawn_interval_ticker(cmd: mpsc::Sender<Cmd>, interval_secs: u64, align: Opti
                 eprintln!("[GLMeter] refresh_align 格式应为 \"HH:MM\"，忽略该配置");
             }
             None
-        });
-    std::thread::spawn(move || loop {
-        let next = match align_time {
-            Some(t) => next_aligned(t, interval, chrono::Local::now()),
-            None => chrono::Local::now() + chrono::Duration::seconds(interval as i64),
-        };
-        let wait = (next - chrono::Local::now())
-            .to_std()
-            .unwrap_or(std::time::Duration::from_secs(interval));
-        std::thread::sleep(wait);
-        if cmd.send(Cmd::Fetch).is_err() {
-            break;
+        })
+}
+
+/// 每天在配置时刻触发一次激活（每轮重读配置，activate_at 增删改即时生效）
+fn spawn_daily_activate(cmd: mpsc::Sender<Cmd>) {
+    std::thread::spawn(move || {
+        // 仅在 activate_at 原始值变化时重新解析（避免每轮重复告警）
+        let mut last_raw: Option<Vec<String>> = None;
+        let mut times: Vec<chrono::NaiveTime> = Vec::new();
+        loop {
+            let raw = config::load().0.activate_at;
+            if last_raw.as_deref() != Some(raw.as_slice()) {
+                times = parse_activate_at(&raw);
+                last_raw = Some(raw);
+            }
+            match next_daily(&times, chrono::Local::now()) {
+                Some(next) => {
+                    let wait = (next - chrono::Local::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::from_secs(TICKER_POLL_SECS));
+                    if wait > std::time::Duration::from_secs(TICKER_POLL_SECS) {
+                        // 距离触发还远：分段睡，及时感知配置变化
+                        std::thread::sleep(std::time::Duration::from_secs(TICKER_POLL_SECS));
+                    } else {
+                        std::thread::sleep(wait);
+                        if cmd.send(Cmd::Activate).is_err() {
+                            return;
+                        }
+                    }
+                }
+                None => std::thread::sleep(std::time::Duration::from_secs(TICKER_POLL_SECS)),
+            }
+        }
+    });
+}
+
+/// 周期刷新（每轮重读配置，interval_secs / refresh_align 即时生效）
+fn spawn_interval_ticker(cmd: mpsc::Sender<Cmd>) {
+    std::thread::spawn(move || {
+        let mut last_fire = chrono::Local::now();
+        // 仅在 refresh_align 原始值变化时重新解析（避免每轮重复告警）
+        let mut last_align_raw: Option<Option<String>> = None;
+        let mut align_time: Option<chrono::NaiveTime> = None;
+        loop {
+            let (interval_raw, align_raw) = {
+                let c = config::load().0;
+                (c.interval_secs, c.refresh_align)
+            };
+            if last_align_raw != Some(align_raw.clone()) {
+                align_time = parse_align(&align_raw);
+                last_align_raw = Some(align_raw);
+            }
+            let interval = interval_raw.max(60);
+            let next = match align_time {
+                Some(t) => next_aligned(t, interval, chrono::Local::now()),
+                None => last_fire + chrono::Duration::seconds(interval as i64),
+            };
+            let now = chrono::Local::now();
+            if now >= next {
+                last_fire = now;
+                if cmd.send(Cmd::Fetch).is_err() {
+                    break;
+                }
+            } else {
+                let wait = (next - now)
+                    .to_std()
+                    .unwrap_or(std::time::Duration::from_secs(interval))
+                    .min(std::time::Duration::from_secs(TICKER_POLL_SECS));
+                std::thread::sleep(wait);
+            }
         }
     });
 }
@@ -340,21 +422,27 @@ pub fn icon_rgba(size: u32) -> image::RgbaImage {
     .to_rgba8()
 }
 
-/// ksni 需要的 ARGB32（network byte order: A R G B）图标
+/// ksni 需要的 ARGB32（network byte order: A R G B）图标。
+/// ksni 每次 update 都会重新拉取 pixmap，缓存解码/缩放结果避免重复计算
 #[cfg(target_os = "linux")]
-pub fn icon_argb(size: u32) -> ksni::Icon {
-    let rgba = icon_rgba(size);
-    let (w, h) = rgba.dimensions();
-    let mut data = Vec::with_capacity((w * h * 4) as usize);
-    for px in rgba.pixels() {
-        let [r, g, b, a] = px.0;
-        data.extend_from_slice(&[a, r, g, b]);
-    }
-    ksni::Icon {
-        width: w as i32,
-        height: h as i32,
-        data,
-    }
+pub fn tray_icon() -> ksni::Icon {
+    static CACHE: std::sync::OnceLock<ksni::Icon> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let rgba = icon_rgba(64);
+            let (w, h) = rgba.dimensions();
+            let mut data = Vec::with_capacity((w * h * 4) as usize);
+            for px in rgba.pixels() {
+                let [r, g, b, a] = px.0;
+                data.extend_from_slice(&[a, r, g, b]);
+            }
+            ksni::Icon {
+                width: w as i32,
+                height: h as i32,
+                data,
+            }
+        })
+        .clone()
 }
 
 pub fn open_config(path: &std::path::Path) {
@@ -413,8 +501,37 @@ fn acquire_single_instance() -> bool {
         }
         Err(_) => {
             eprintln!("GLMeter 已在运行（锁文件: {}）", path.display());
+            #[cfg(target_os = "windows")]
+            alert_already_running();
             false
         }
+    }
+}
+
+/// GUI 子系统无控制台：双实例退出前弹窗提示，避免「双击没反应」
+#[cfg(target_os = "windows")]
+fn alert_already_running() {
+    use std::ffi::c_void;
+    const MB_OK: u32 = 0x0;
+    const MB_ICONINFORMATION: u32 = 0x40;
+
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, utype: u32)
+            -> i32;
+    }
+
+    let text: Vec<u16> = "GLMeter 已在运行。\n\n请使用托盘中的现有实例；如需重启请先退出。"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption: Vec<u16> = "GLMeter".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
     }
 }
 

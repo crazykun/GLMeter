@@ -24,14 +24,6 @@ enum UserEvent {
 }
 
 pub fn run(state: Arc<Mutex<UiState>>) {
-    let (interval_secs, align, activate_at) = {
-        let ui = state.lock().unwrap();
-        (
-            ui.cfg.interval_secs,
-            ui.cfg.refresh_align.clone(),
-            ui.cfg.activate_at.clone(),
-        )
-    };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
     // mut 仅为 macOS set_activation_policy 所需
@@ -67,7 +59,8 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     spawn_worker(cmd_rx, cmd_tx.clone(), state.clone(), move || {
         let _ = render_proxy.send_event(UserEvent::Render);
     });
-    spawn_ticker(cmd_tx.clone(), interval_secs, align, activate_at);
+    // ticker 自行重读配置，无需传入快照
+    spawn_ticker(cmd_tx.clone());
 
     // 初次构建菜单（结构指纹 + 句柄）
     let (menu0, slots0, shape0) = {

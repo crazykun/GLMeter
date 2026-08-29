@@ -97,7 +97,7 @@ pub fn fetch_quota(
 ) -> Result<QuotaSnapshot, String> {
     let resp = client
         .get(cfg.monitor_url())
-        .header("Authorization", cfg.api_key.trim())
+        .bearer_auth(cfg.api_key.trim())
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -109,7 +109,12 @@ pub fn fetch_quota(
         return Err(format!("HTTP {status}: {msg}"));
     }
 
-    let parsed: RawResp = serde_json::from_str(&body).map_err(|e| format!("解析失败: {e}"))?;
+    parse_quota(&body)
+}
+
+/// 响应体 → QuotaSnapshot（纯函数，便于单测）
+pub fn parse_quota(body: &str) -> Result<QuotaSnapshot, String> {
+    let parsed: RawResp = serde_json::from_str(body).map_err(|e| format!("解析失败: {e}"))?;
     if !parsed.success && parsed.data.is_none() {
         return Err(if parsed.msg.is_empty() {
             format!("code {}", parsed.code)
@@ -200,4 +205,83 @@ fn extract_msg(body: &str) -> Option<String> {
                 .or_else(|| v.get("error"))
                 .and_then(|m| m.as_str().map(String::from))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_sorted_by_reset_labeled() {
+        let body = r#"{
+            "success": true,
+            "data": { "level": "lite", "limits": [
+                { "type": "TOKENS_LIMIT", "percentage": 10.0 },
+                { "type": "TOKENS_LIMIT", "percentage": 40.0, "nextResetTime": 1767225600000 }
+            ] }
+        }"#;
+        let s = parse_quota(body).unwrap();
+        assert_eq!(s.level, "lite");
+        assert_eq!(s.windows.len(), 2);
+        // 有 nextResetTime 的窗口排最前 → five_hour 命中它
+        let w5 = s.five_hour().unwrap();
+        assert!(w5.activated);
+        assert!((w5.used_pct - 40.0).abs() < 1e-9);
+        assert_eq!(w5.label, "5小时额度");
+        assert_eq!(s.windows[1].label, "每周额度");
+        assert!(!s.windows[1].activated);
+        assert!(s.windows[1].next_reset.is_none());
+        // 任一窗口已激活 → 无需激活提示
+        assert!(!s.needs_activation());
+    }
+
+    #[test]
+    fn all_unactivated_needs_activation() {
+        let body = r#"{ "success": true, "data": { "limits": [
+            { "type": "TOKENS_LIMIT", "percentage": 0.0 }
+        ] } }"#;
+        let s = parse_quota(body).unwrap();
+        assert!(s.needs_activation());
+        assert!(s.five_hour().unwrap().next_reset.is_none());
+        // 无窗口时不算「需要激活」
+        let empty = parse_quota(r#"{ "success": true, "data": {} }"#).unwrap();
+        assert!(!empty.needs_activation());
+    }
+
+    #[test]
+    fn mcp_parsed_and_zero_usage_filtered() {
+        let body = r#"{ "success": true, "data": { "limits": [
+            { "type": "TIME_LIMIT", "percentage": 25.0, "usage": 100, "currentValue": 25,
+              "nextResetTime": 1767225600000,
+              "usageDetails": [
+                  { "modelCode": "mcp-a", "usage": 5 },
+                  { "modelCode": "mcp-b", "usage": 0 }
+              ] }
+        ] } }"#;
+        let s = parse_quota(body).unwrap();
+        let mcp = s.mcp.expect("应有 TIME_LIMIT");
+        assert_eq!((mcp.used, mcp.total), (25, 100));
+        assert_eq!(mcp.details, vec![("mcp-a".to_string(), 5)]);
+        assert!(mcp.next_reset.is_some());
+    }
+
+    #[test]
+    fn error_responses() {
+        let e = parse_quota(r#"{ "code": 401, "msg": "invalid api key", "success": false }"#)
+            .unwrap_err();
+        assert_eq!(e, "invalid api key");
+        // success=false 且无 msg → 回退到 code
+        let e2 = parse_quota(r#"{ "code": 500, "success": false }"#).unwrap_err();
+        assert_eq!(e2, "code 500");
+        // 非 JSON body（如网关 502 页面）
+        assert!(parse_quota("<html>502</html>").is_err());
+    }
+
+    #[test]
+    fn extract_msg_variants() {
+        assert_eq!(extract_msg(r#"{"msg":"boom"}"#), Some("boom".into()));
+        assert_eq!(extract_msg(r#"{"error":"bad"}"#), Some("bad".into()));
+        assert_eq!(extract_msg("not json"), None);
+        assert_eq!(extract_msg(r#"{"msg":42}"#), None);
+    }
 }

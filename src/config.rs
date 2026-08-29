@@ -87,6 +87,20 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// 配置文件含 api_key：Unix 下收紧为 owner-only（0600），仅当现有权限过宽时修改
+#[cfg(unix)]
+fn restrict_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = fs::metadata(path) {
+        if md.permissions().mode() & 0o077 != 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_perms(_path: &std::path::Path) {}
+
 /// 读取配置；若文件不存在则写入默认模板，方便用户直接编辑。
 /// 环境变量 GLM_API_KEY / GLM_BASE_URL 可覆盖文件内容。
 pub fn load() -> (Config, PathBuf) {
@@ -101,7 +115,12 @@ pub fn load() -> (Config, PathBuf) {
             let _ = fs::create_dir_all(dir);
         }
         let template = toml::to_string_pretty(&cfg).unwrap_or_default();
-        let _ = fs::write(&path, template);
+        if fs::write(&path, template).is_ok() {
+            restrict_perms(&path);
+        }
+    } else {
+        // 旧版本创建的文件可能是组/其他用户可读，顺手收紧
+        restrict_perms(&path);
     }
 
     if let Ok(k) = std::env::var("GLM_API_KEY") {

@@ -41,7 +41,7 @@ impl Tray for GlmTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        vec![crate::icon_argb(64)]
+        vec![crate::tray_icon()]
     }
 
     /// 左键点击托盘图标 → 立即刷新
@@ -96,14 +96,6 @@ fn escape_label(s: &str) -> String {
 }
 
 pub fn run(state: Arc<Mutex<UiState>>) {
-    let (interval_secs, align, activate_at) = {
-        let ui = state.lock().unwrap();
-        (
-            ui.cfg.interval_secs,
-            ui.cfg.refresh_align.clone(),
-            ui.cfg.activate_at.clone(),
-        )
-    };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
     let tray = GlmTray {
@@ -123,7 +115,8 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     spawn_worker(cmd_rx, cmd_tx.clone(), state, move || {
         let _ = handle.update(|_| ());
     });
-    spawn_ticker(cmd_tx, interval_secs, align, activate_at);
+    // ticker 自行重读配置，无需传入快照
+    spawn_ticker(cmd_tx);
 
     // 主线程驻留（ksni 服务与 worker 均在各自线程）
     loop {
