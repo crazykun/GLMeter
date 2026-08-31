@@ -94,7 +94,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
                 }
                 UserEvent::Menu(id) => {
                     let cmd = match id.as_str() {
-                        ui::ID_ACTIVATE => Cmd::Activate,
+                        ui::ID_ACTIVATE => Cmd::Activate { scheduled: false },
                         ui::ID_REFRESH => Cmd::Fetch,
                         ui::ID_CONFIG => Cmd::OpenConfig,
                         ui::ID_REPO => Cmd::OpenRepo,

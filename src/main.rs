@@ -18,7 +18,9 @@ use ui::UiState;
 /// 后台命令
 pub enum Cmd {
     Fetch,
-    Activate,
+    /// scheduled = 定点（activate_at）/ 自动（auto_activate）触发：
+    /// 撞上仍在计费的旧窗口时推迟到其重置后再发，避免请求白白计入垂死窗口
+    Activate { scheduled: bool },
     OpenConfig,
     OpenRepo,
     Quit,
@@ -61,29 +63,59 @@ pub fn spawn_worker(
         let mut activate_retries: u32 = 0;
         const MAX_ACTIVATE_RETRIES: u32 = 3;
         const RETRY_DELAY_SECS: u64 = 60;
-        // 整轮重试（首发 + 3 次重试）全部失败后进入指数退避冷却，
-        // 防止「未生效 → 5 秒后再激活」的无限请求循环
-        let mut failed_rounds: u32 = 0;
-        let mut cooldown_until: Option<chrono::DateTime<chrono::Local>> = None;
-        /// 退避时长：5 分钟起步、每失败一轮翻倍、封顶 1 小时
-        const ACTIVATE_BACKOFF_BASE_SECS: u64 = 300;
-        const ACTIVATE_BACKOFF_MAX_SECS: u64 = 3600;
-        // 首轮查询
-        let _ = cmd_tx.send(Cmd::Fetch);
-        for cmd in cmd_rx {
-            match cmd {
-                Cmd::Fetch => {
-                    worker_fetch(&client, &state);
-                    notify();
-                    // 窗口已激活（服务端最终生效/用户手动激活）→ 清除退避状态
-                    if window_active(&state) {
-                        failed_rounds = 0;
-                        cooldown_until = None;
-                    }
-                    schedule_auto_activate(&cmd_tx, &state, &mut scheduled, cooldown_until);
+    // 整轮重试（首发 + 3 次重试）全部失败后进入指数退避冷却，
+    // 防止「未生效 → 5 秒后再激活」的无限请求循环
+    let mut failed_rounds: u32 = 0;
+    let mut cooldown_until: Option<chrono::DateTime<chrono::Local>> = None;
+    /// 退避时长：5 分钟起步、每失败一轮翻倍、封顶 1 小时
+    const ACTIVATE_BACKOFF_BASE_SECS: u64 = 300;
+    const ACTIVATE_BACKOFF_MAX_SECS: u64 = 3600;
+    // 首轮查询
+    let _ = cmd_tx.send(Cmd::Fetch);
+    for cmd in cmd_rx {
+        match cmd {
+            Cmd::Fetch => {
+                worker_fetch(&client, &state);
+                notify();
+                // 窗口已激活（服务端最终生效/用户手动激活）→ 清除退避状态
+                if window_active(&state) {
+                    failed_rounds = 0;
+                    cooldown_until = None;
                 }
-                Cmd::Activate => {
-                    let attempt = activate_retries;
+                schedule_auto_activate(&cmd_tx, &state, &mut scheduled, cooldown_until);
+            }
+            Cmd::Activate { scheduled: sched } => {
+                // 定点激活若在旧窗口重置前发出，最小请求会计入垂死窗口、
+                // 新窗口不会被开启（表现为「定点激活失效」）→ 推迟到重置后续接
+                if sched {
+                    if let Some(until) = postpone_until(current_reset(&state), chrono::Local::now())
+                    {
+                        eprintln!(
+                            "[GLMeter] 定点激活：当前窗口尚未重置，推迟至 {} 续接新窗口",
+                            until.format("%H:%M")
+                        );
+                        set_busy(
+                            &state,
+                            Some(format!(
+                                "定点激活：等待当前窗口{}重置后自动续接…",
+                                until.format("%H:%M")
+                            )),
+                        );
+                        notify();
+                        let tx = cmd_tx.clone();
+                        std::thread::spawn(move || {
+                            let wait = (until - chrono::Local::now())
+                                .to_std()
+                                .unwrap_or_default();
+                            std::thread::sleep(wait);
+                            // 续接时窗口可能已被用户自己开启，直接发一条最小请求即可，
+                            // 无需再推迟（最多浪费几枚 token）
+                            let _ = tx.send(Cmd::Activate { scheduled: false });
+                        });
+                        continue;
+                    }
+                }
+                let attempt = activate_retries;
                     set_busy(
                         &state,
                         Some(if attempt == 0 {
@@ -120,7 +152,7 @@ pub fn spawn_worker(
                         let tx = cmd_tx.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS));
-                            let _ = tx.send(Cmd::Activate);
+                            let _ = tx.send(Cmd::Activate { scheduled: sched });
                         });
                     } else {
                         // 整轮重试失败：指数退避，到期后 Fetch 重新评估（而非直接再激活）
@@ -221,8 +253,29 @@ fn schedule_auto_activate(
             .to_std()
             .unwrap_or(std::time::Duration::from_secs(1));
         std::thread::sleep(wait);
-        let _ = tx.send(Cmd::Activate);
+        let _ = tx.send(Cmd::Activate { scheduled: true });
     });
+}
+
+/// 当前 5 小时窗口的重置时间（无快照/未激活/异常时为 None）
+fn current_reset(state: &Arc<Mutex<UiState>>) -> Option<chrono::DateTime<chrono::Local>> {
+    let ui = state.lock().unwrap();
+    match &ui.status {
+        ui::Status::Ok(s) => s.five_hour().and_then(|w| w.next_reset),
+        _ => None,
+    }
+}
+
+/// 定点激活决策：窗口已激活且重置时间在未来 → 推迟到重置 + 60 秒再发请求
+/// （请求早于重置发出只会计入垂死窗口，新窗口不会被开启）；
+/// 其余情况（未激活 / 重置已过 / 查询失败）→ None，立即发送
+fn postpone_until(
+    next_reset: Option<chrono::DateTime<chrono::Local>>,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    next_reset
+        .filter(|r| *r > now)
+        .map(|r| r + chrono::Duration::seconds(60))
 }
 
 fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>) {
@@ -239,12 +292,16 @@ fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>)
     };
 }
 
-/// 5 小时窗口是否已激活（nextResetTime 可查）
+/// 5 小时窗口是否已激活（nextResetTime 可查且尚在有效期）。
+/// 安全边际 90 秒：刚激活的新窗口 reset = now+5h 必然通过；
+/// 垂死/刚过期的旧窗口（reset ≤ now+90s）视为未生效 → 触发重试，
+/// 60 秒后的重试会落在重置之后、真正开启新窗口
 fn window_active(state: &Arc<Mutex<UiState>>) -> bool {
     let ui = state.lock().unwrap();
+    let margin = chrono::Local::now() + chrono::Duration::seconds(90);
     matches!(&ui.status, ui::Status::Ok(s) if s
         .five_hour()
-        .is_some_and(|w| w.next_reset.is_some()))
+        .is_some_and(|w| w.next_reset.is_some_and(|r| r > margin)))
 }
 
 fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
@@ -296,7 +353,8 @@ fn parse_align(align: &Option<String>) -> Option<chrono::NaiveTime> {
         })
 }
 
-/// 每天在配置时刻触发一次激活（每轮重读配置，activate_at 增删改即时生效）
+/// 每天在配置时刻触发一次激活（每轮重读配置，activate_at 增删改即时生效）。
+/// 触发的激活若撞上仍在计费的旧窗口，worker 会自动推迟到重置后续接
 fn spawn_daily_activate(cmd: mpsc::Sender<Cmd>) {
     std::thread::spawn(move || {
         // 仅在 activate_at 原始值变化时重新解析（避免每轮重复告警）
@@ -318,7 +376,7 @@ fn spawn_daily_activate(cmd: mpsc::Sender<Cmd>) {
                         std::thread::sleep(std::time::Duration::from_secs(TICKER_POLL_SECS));
                     } else {
                         std::thread::sleep(wait);
-                        if cmd.send(Cmd::Activate).is_err() {
+                        if cmd.send(Cmd::Activate { scheduled: true }).is_err() {
                             return;
                         }
                     }
@@ -655,7 +713,9 @@ fn run_check(also_activate: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, NaiveTime, TimeZone};
+    use chrono::{Duration, Local, NaiveTime, TimeZone};
+    use crate::config::Config;
+    use std::path::PathBuf;
 
     fn today_at(h: u32, m: u32, s: u32) -> chrono::DateTime<chrono::Local> {
         let naive = chrono::Local::now()
@@ -696,6 +756,55 @@ mod tests {
         assert_eq!(ok.len(), 3);
         let bad = parse_activate_at(&["9点".into(), "".into()]);
         assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn scheduled_activation_postponed_until_after_reset() {
+        let now = today_at(14, 0, 0);
+        // 旧窗口还活着（14:00:30 重置）→ 推迟到重置 + 60s，绝不提前
+        let reset = now + Duration::seconds(30);
+        assert_eq!(
+            postpone_until(Some(reset), now),
+            Some(now + Duration::seconds(90))
+        );
+        // 旧窗口残余很久（次日才重置）→ 同样只等重置 + 60s
+        let late = now + Duration::hours(4);
+        assert_eq!(
+            postpone_until(Some(late), now),
+            Some(late + Duration::seconds(60))
+        );
+        // 窗口未激活 / 重置已过 / 查询失败 → 立即发送
+        assert_eq!(postpone_until(None, now), None);
+        assert_eq!(postpone_until(Some(now - Duration::seconds(1)), now), None);
+    }
+
+    #[test]
+    fn window_active_requires_future_reset_with_margin() {
+        let mk = |reset: Option<chrono::DateTime<chrono::Local>>| {
+            let snap = crate::api::QuotaSnapshot {
+                level: "lite".into(),
+                windows: vec![crate::api::TokenWindow {
+                    label: "5小时额度".into(),
+                    used_pct: 0.0,
+                    activated: reset.is_some(),
+                    next_reset: reset,
+                }],
+                mcp: None,
+                fetched_at: Local::now(),
+            };
+            let state = Arc::new(Mutex::new(UiState::new(
+                Config::default(),
+                PathBuf::from("/tmp/x"),
+            )));
+            state.lock().unwrap().status = ui::Status::Ok(snap);
+            state
+        };
+        // 新窗口（reset 在 5h 后）→ 激活有效
+        assert!(window_active(&mk(Some(Local::now() + Duration::hours(5)))));
+        // 垂死窗口（30s 后重置）/ 已过期窗口 → 不算激活成功，应触发重试
+        assert!(!window_active(&mk(Some(Local::now() + Duration::seconds(30)))));
+        assert!(!window_active(&mk(Some(Local::now() - Duration::minutes(1)))));
+        assert!(!window_active(&mk(None)));
     }
 
     #[test]

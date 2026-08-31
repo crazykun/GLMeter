@@ -66,7 +66,7 @@ impl Tray for GlmTray {
                         label: escape_label(&text),
                         activate: Box::new(move |_| {
                             let cmd = match id {
-                                ID_ACTIVATE => Cmd::Activate,
+                                ID_ACTIVATE => Cmd::Activate { scheduled: false },
                                 ID_REFRESH => Cmd::Fetch,
                                 ID_CONFIG => Cmd::OpenConfig,
                                 ID_REPO => Cmd::OpenRepo,
