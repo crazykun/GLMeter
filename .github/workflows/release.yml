@@ -163,14 +163,54 @@ jobs:
             glmeter-*.dmg
             glmeter-*-setup.exe
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+  # 发布单独一个 job：等全部平台构建完成后执行一次。
+  # （此前 Release 步骤放在 matrix 里，4 个任务各自更新同一 Release，
+  #   导致说明被重复追加 4 遍）
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
         with:
-          generate_release_notes: true
+          fetch-depth: 0 # changelog 需要两个 tag 之间的完整历史
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 按 conventional commit 类型分组生成说明；无匹配提交的分组整节省略
+      - name: Generate release notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          RANGE="${PREV:+$PREV..}$TAG"
+          strip() { sed -E 's/^(feat|fix|ci|build|chore|docs|style|refactor|perf|test)(\([^)]*\))?:[[:space:]]+//'; }
+          group() { git log --no-merges --pretty=format:'%s' "$RANGE" | grep -Ei "^$1" | strip | sed 's/^/- /' || true; }
+          {
+            echo "## What's Changed"
+            echo
+            for entry in \
+              "🚀 新特性|feat" \
+              "🐛 问题修复|fix" \
+              "📚 文档|docs" \
+              "🛠 构建 / CI|^(ci|build|chore)"
+            do
+              title=${entry%%|*}; pat=${entry#*|}
+              body=$(group "$pat")
+              if [ -n "$body" ]; then echo "### $title"; echo; echo "$body"; echo; fi
+            done
+            echo "**Full Changelog**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV:-HEAD}...$TAG"
+          } > RELEASE_BODY.md
+          cat RELEASE_BODY.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          body_path: RELEASE_BODY.md
           files: |
-            glmeter-*.tar.gz
-            glmeter-*.zip
-            glmeter*.deb
-            glmeter-*.dmg
-            glmeter-*-setup.exe
+            dist/glmeter-*.tar.gz
+            dist/glmeter-*.zip
+            dist/glmeter*.deb
+            dist/glmeter-*.dmg
+            dist/glmeter-*-setup.exe
