@@ -20,7 +20,9 @@ pub enum Cmd {
     Fetch,
     /// scheduled = 定点（activate_at）/ 自动（auto_activate）触发：
     /// 撞上仍在计费的旧窗口时推迟到其重置后再发，避免请求白白计入垂死窗口
-    Activate { scheduled: bool },
+    Activate {
+        scheduled: bool,
+    },
     OpenConfig,
     OpenRepo,
     Quit,
@@ -63,59 +65,59 @@ pub fn spawn_worker(
         let mut activate_retries: u32 = 0;
         const MAX_ACTIVATE_RETRIES: u32 = 3;
         const RETRY_DELAY_SECS: u64 = 60;
-    // 整轮重试（首发 + 3 次重试）全部失败后进入指数退避冷却，
-    // 防止「未生效 → 5 秒后再激活」的无限请求循环
-    let mut failed_rounds: u32 = 0;
-    let mut cooldown_until: Option<chrono::DateTime<chrono::Local>> = None;
-    /// 退避时长：5 分钟起步、每失败一轮翻倍、封顶 1 小时
-    const ACTIVATE_BACKOFF_BASE_SECS: u64 = 300;
-    const ACTIVATE_BACKOFF_MAX_SECS: u64 = 3600;
-    // 首轮查询
-    let _ = cmd_tx.send(Cmd::Fetch);
-    for cmd in cmd_rx {
-        match cmd {
-            Cmd::Fetch => {
-                worker_fetch(&client, &state);
-                notify();
-                // 窗口已激活（服务端最终生效/用户手动激活）→ 清除退避状态
-                if window_active(&state) {
-                    failed_rounds = 0;
-                    cooldown_until = None;
-                }
-                schedule_auto_activate(&cmd_tx, &state, &mut scheduled, cooldown_until);
-            }
-            Cmd::Activate { scheduled: sched } => {
-                // 定点激活若在旧窗口重置前发出，最小请求会计入垂死窗口、
-                // 新窗口不会被开启（表现为「定点激活失效」）→ 推迟到重置后续接
-                if sched {
-                    if let Some(until) = postpone_until(current_reset(&state), chrono::Local::now())
-                    {
-                        eprintln!(
-                            "[GLMeter] 定点激活：当前窗口尚未重置，推迟至 {} 续接新窗口",
-                            until.format("%H:%M")
-                        );
-                        set_busy(
-                            &state,
-                            Some(format!(
-                                "定点激活：等待当前窗口{}重置后自动续接…",
-                                until.format("%H:%M")
-                            )),
-                        );
-                        notify();
-                        let tx = cmd_tx.clone();
-                        std::thread::spawn(move || {
-                            let wait = (until - chrono::Local::now())
-                                .to_std()
-                                .unwrap_or_default();
-                            std::thread::sleep(wait);
-                            // 续接时窗口可能已被用户自己开启，直接发一条最小请求即可，
-                            // 无需再推迟（最多浪费几枚 token）
-                            let _ = tx.send(Cmd::Activate { scheduled: false });
-                        });
-                        continue;
+        // 整轮重试（首发 + 3 次重试）全部失败后进入指数退避冷却，
+        // 防止「未生效 → 5 秒后再激活」的无限请求循环
+        let mut failed_rounds: u32 = 0;
+        let mut cooldown_until: Option<chrono::DateTime<chrono::Local>> = None;
+        /// 退避时长：5 分钟起步、每失败一轮翻倍、封顶 1 小时
+        const ACTIVATE_BACKOFF_BASE_SECS: u64 = 300;
+        const ACTIVATE_BACKOFF_MAX_SECS: u64 = 3600;
+        // 首轮查询
+        let _ = cmd_tx.send(Cmd::Fetch);
+        for cmd in cmd_rx {
+            match cmd {
+                Cmd::Fetch => {
+                    worker_fetch(&client, &state);
+                    notify();
+                    // 窗口已激活（服务端最终生效/用户手动激活）→ 清除退避状态
+                    if window_active(&state) {
+                        failed_rounds = 0;
+                        cooldown_until = None;
                     }
+                    schedule_auto_activate(&cmd_tx, &state, &mut scheduled, cooldown_until);
                 }
-                let attempt = activate_retries;
+                Cmd::Activate { scheduled: sched } => {
+                    // 定点激活若在旧窗口重置前发出，最小请求会计入垂死窗口、
+                    // 新窗口不会被开启（表现为「定点激活失效」）→ 推迟到重置后续接
+                    if sched {
+                        if let Some(until) =
+                            postpone_until(current_reset(&state), chrono::Local::now())
+                        {
+                            eprintln!(
+                                "[GLMeter] 定点激活：当前窗口尚未重置，推迟至 {} 续接新窗口",
+                                until.format("%H:%M")
+                            );
+                            set_busy(
+                                &state,
+                                Some(format!(
+                                    "定点激活：等待当前窗口{}重置后自动续接…",
+                                    until.format("%H:%M")
+                                )),
+                            );
+                            notify();
+                            let tx = cmd_tx.clone();
+                            std::thread::spawn(move || {
+                                let wait =
+                                    (until - chrono::Local::now()).to_std().unwrap_or_default();
+                                std::thread::sleep(wait);
+                                // 续接时窗口可能已被用户自己开启，直接发一条最小请求即可，
+                                // 无需再推迟（最多浪费几枚 token）
+                                let _ = tx.send(Cmd::Activate { scheduled: false });
+                            });
+                            continue;
+                        }
+                    }
+                    let attempt = activate_retries;
                     set_busy(
                         &state,
                         Some(if attempt == 0 {
@@ -713,8 +715,8 @@ fn run_check(also_activate: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Local, NaiveTime, TimeZone};
     use crate::config::Config;
+    use chrono::{Duration, Local, NaiveTime, TimeZone};
     use std::path::PathBuf;
 
     fn today_at(h: u32, m: u32, s: u32) -> chrono::DateTime<chrono::Local> {
@@ -802,8 +804,12 @@ mod tests {
         // 新窗口（reset 在 5h 后）→ 激活有效
         assert!(window_active(&mk(Some(Local::now() + Duration::hours(5)))));
         // 垂死窗口（30s 后重置）/ 已过期窗口 → 不算激活成功，应触发重试
-        assert!(!window_active(&mk(Some(Local::now() + Duration::seconds(30)))));
-        assert!(!window_active(&mk(Some(Local::now() - Duration::minutes(1)))));
+        assert!(!window_active(&mk(Some(
+            Local::now() + Duration::seconds(30)
+        ))));
+        assert!(!window_active(&mk(Some(
+            Local::now() - Duration::minutes(1)
+        ))));
         assert!(!window_active(&mk(None)));
     }
 
