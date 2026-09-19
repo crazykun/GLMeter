@@ -130,6 +130,17 @@ impl Slots {
     }
 }
 
+/// 槽位顺序对应的文本：与 [`Slots::from_entries`] 同一过滤规则（跳过分隔线）
+fn slot_texts(entries: &[ui::MenuEntry]) -> Vec<&String> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            ui::MenuEntry::Info(t) | ui::MenuEntry::Button { text: t, .. } => Some(t),
+            ui::MenuEntry::Separator => None,
+        })
+        .collect()
+}
+
 fn menu_item(e: &ui::MenuEntry) -> MenuItem {
     match e {
         ui::MenuEntry::Info(t) => MenuItem::with_id("info", t, false, None),
@@ -170,16 +181,74 @@ fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc
         tray.set_menu(Some(Box::new(build_menu(&entries))));
         *slots = Some((shape, Slots::from_entries(&entries)));
     } else if let Some((_, sl)) = slots.as_ref() {
-        for (item, e) in sl.0.iter().zip(entries.iter()) {
-            match e {
-                ui::MenuEntry::Info(t) | ui::MenuEntry::Button { text: t, .. } => {
-                    item.set_text(t);
-                }
-                ui::MenuEntry::Separator => {}
-            }
+        // 槽位跳过了分隔线，配对时也必须按同一规则过滤，
+        // 否则首个分隔线之后整体错位：紧跟分隔线的行永远不更新
+        for (item, t) in sl.0.iter().zip(slot_texts(&entries)) {
+            item.set_text(t);
         }
     }
 
     let _ = tray.set_tooltip(Some(&tip));
     tray.set_title(Some(&title));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{McpLimit, QuotaSnapshot, TokenWindow};
+    use crate::ui::{MenuEntry, Status};
+    use chrono::Local;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    fn ok_state() -> Arc<Mutex<UiState>> {
+        let snap = QuotaSnapshot {
+            level: "lite".into(),
+            windows: vec![TokenWindow {
+                label: "5小时额度".into(),
+                used_pct: 30.0,
+                activated: true,
+                next_reset: Some(Local::now() + chrono::Duration::hours(3)),
+            }],
+            mcp: Some(McpLimit {
+                used: 13,
+                total: 100,
+                used_pct: 13.0,
+                details: vec![("zread".into(), 7)],
+                next_reset: Some(Local::now() + chrono::Duration::days(20)),
+            }),
+            fetched_at: Local::now(),
+        };
+        let state = Arc::new(Mutex::new(UiState::new(
+            crate::config::Config::default(),
+            PathBuf::from("/tmp/x"),
+        )));
+        state.lock().unwrap().status = Status::Ok(snap);
+        state
+    }
+
+    /// 槽位（跳过分隔线的菜单句柄）与 slot_texts 必须按同一规则过滤，
+    /// 否则 render 原地 set_text 时首个分隔线之后整体错位、
+    /// 紧跟分隔线的行永远不更新（macOS/Windows 菜单"不刷新"的根因）
+    #[test]
+    fn slots_and_slot_texts_align_on_non_separator_entries() {
+        let entries = ui::menu_entries(&ok_state().lock().unwrap());
+        assert!(entries.iter().any(|e| matches!(e, MenuEntry::Separator)));
+
+        let slots = Slots::from_entries(&entries);
+        let texts = slot_texts(&entries);
+        assert_eq!(slots.0.len(), texts.len(), "槽位数与文本数必须一致");
+
+        let expected: Vec<&String> = entries
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Info(t) | MenuEntry::Button { text: t, .. } => Some(t),
+                MenuEntry::Separator => None,
+            })
+            .collect();
+        assert_eq!(texts, expected);
+        // 含数据的行（进度条）必须真的出现在槽位文本里，
+        // 旧实现的错位会让这一行配到 Separator 而被跳过
+        assert!(texts.iter().any(|t| t.contains("5小时额度")));
+    }
 }
