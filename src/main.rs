@@ -31,6 +31,8 @@ pub enum Cmd {
     OpenRepo,
     /// 打开官网重置卡管理页
     OpenResetSite,
+    /// 仅重绘（菜单倒计时节拍），不发网络请求
+    Render,
     Quit,
 }
 
@@ -198,6 +200,7 @@ pub fn spawn_worker(
                 }
                 Cmd::OpenRepo => open_url(ui::REPO_URL),
                 Cmd::OpenResetSite => open_url(ui::RESET_SITE_URL),
+                Cmd::Render => notify(),
                 Cmd::UseResetCard { week } => {
                     use_reset_card_flow(&client, &state, week, &notify);
                 }
@@ -452,12 +455,27 @@ fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
 /// 调度器入口：
 /// - 周期刷新：每 interval_secs（可对齐网格）自动 Fetch
 /// - 定点激活：activate_at 每天在配置时刻自动 Activate
+/// - 渲染节拍：每 30 秒用当前快照重绘菜单/标题（不发请求），
+///   倒计时和"xx分后"不会停在两次刷新之间
 ///
-/// 两个线程每轮醒来都重读配置，interval_secs / refresh_align / activate_at
+/// 各线程每轮醒来都重读配置，interval_secs / refresh_align / activate_at
 /// 的改动无需重启即可生效（发现粒度约 TICKER_POLL_SECS）。
 pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>) {
     spawn_interval_ticker(cmd.clone());
-    spawn_daily_activate(cmd);
+    spawn_daily_activate(cmd.clone());
+    spawn_render_ticker(cmd);
+}
+
+/// 渲染节拍间隔：倒计时精度以分钟计，30 秒足够跟上显示
+const RENDER_TICK_SECS: u64 = 30;
+
+fn spawn_render_ticker(cmd: mpsc::Sender<Cmd>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(RENDER_TICK_SECS));
+        if cmd.send(Cmd::Render).is_err() {
+            return;
+        }
+    });
 }
 
 /// 单次睡眠封顶：既保证定点时刻精确触发，又能及时发现配置变更
