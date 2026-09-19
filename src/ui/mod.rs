@@ -20,6 +20,12 @@ pub const ID_REFRESH: &str = "refresh";
 pub const ID_CONFIG: &str = "config";
 pub const ID_REPO: &str = "repo";
 pub const ID_QUIT: &str = "quit";
+pub const ID_USE_RESET_5H: &str = "use_reset_5h";
+pub const ID_USE_RESET_WEEK: &str = "use_reset_week";
+pub const ID_RESET_SITE: &str = "reset_site";
+
+/// 官网重置卡管理页（无卡/接口失败时的兜底入口）
+pub const RESET_SITE_URL: &str = "https://www.bigmodel.cn/coding-plan/personal/usage";
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO: &str = "github.com/crazykun/GLMeter";
@@ -145,6 +151,7 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
                     v.push(MenuEntry::Info(format!("  ↻ 重置 {}", fmt_reset(&dt))));
                 }
             }
+            push_reset_entries(&mut v, s, state.cfg.base_url.contains("bigmodel.cn"));
         }
     }
 
@@ -185,6 +192,57 @@ fn activate_text(state: &UiState) -> &'static str {
     match &state.status {
         Status::Ok(s) if s.needs_activation() => "⚡ 激活 5 小时额度（当前未激活）",
         _ => "⚡ 激活额度（发送 \"1\"）",
+    }
+}
+
+/// 重置卡菜单项：有可用卡 → 每种一张「点击使用」按钮；无卡/拿不到余额 → 官网入口兜底
+fn push_reset_entries(v: &mut Vec<MenuEntry>, s: &QuotaSnapshot, domestic: bool) {
+    let mut rows: Vec<MenuEntry> = Vec::new();
+    match &s.resets {
+        Some(r) => {
+            for (week, label, id) in [
+                (false, "5小时额度", ID_USE_RESET_5H),
+                (true, "周额度", ID_USE_RESET_WEEK),
+            ] {
+                let n = r.available_count(week);
+                if n == 0 {
+                    continue;
+                }
+                let expire = r
+                    .pick(week)
+                    .map(|rec| fmt_expire(&rec.expire_time))
+                    .unwrap_or_default();
+                rows.push(MenuEntry::Button {
+                    id,
+                    text: format!("↩ 重置卡恢复{label}（×{n} · 最早 {expire} 过期）"),
+                });
+            }
+            if rows.is_empty() {
+                rows.push(MenuEntry::Button {
+                    id: ID_RESET_SITE,
+                    text: "↗ 重置卡已用完 · 官网管理".into(),
+                });
+            }
+        }
+        // 余额获取失败：仅国内站有此接口，避免国际版菜单出现死链接
+        None if domestic => rows.push(MenuEntry::Button {
+            id: ID_RESET_SITE,
+            text: "↗ 管理重置卡（官网）".into(),
+        }),
+        None => {}
+    }
+    if !rows.is_empty() {
+        v.push(MenuEntry::Separator);
+        v.append(&mut rows);
+    }
+}
+
+/// "2026-10-01 23:59:59" → "10-01 23:59"（异常格式原样返回）
+fn fmt_expire(s: &str) -> &str {
+    if s.len() >= 16 && s.as_bytes()[4] == b'-' {
+        &s[5..16]
+    } else {
+        s
     }
 }
 

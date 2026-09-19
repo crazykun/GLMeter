@@ -98,6 +98,9 @@ pub fn run(state: Arc<Mutex<UiState>>) {
                         ui::ID_REFRESH => Cmd::Fetch,
                         ui::ID_CONFIG => Cmd::OpenConfig,
                         ui::ID_REPO => Cmd::OpenRepo,
+                        ui::ID_USE_RESET_5H => Cmd::UseResetCard { week: false },
+                        ui::ID_USE_RESET_WEEK => Cmd::UseResetCard { week: true },
+                        ui::ID_RESET_SITE => Cmd::OpenResetSite,
                         ui::ID_QUIT => {
                             *control_flow = ControlFlow::Exit;
                             return;
@@ -218,6 +221,7 @@ mod tests {
                 next_reset: Some(Local::now() + chrono::Duration::days(20)),
             }),
             fetched_at: Local::now(),
+            resets: None,
         };
         let state = Arc::new(Mutex::new(UiState::new(
             crate::config::Config::default(),

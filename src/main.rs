@@ -23,8 +23,14 @@ pub enum Cmd {
     Activate {
         scheduled: bool,
     },
+    /// 使用一张重置卡（week=false → 5 小时额度，true → 周额度）
+    UseResetCard {
+        week: bool,
+    },
     OpenConfig,
     OpenRepo,
+    /// 打开官网重置卡管理页
+    OpenResetSite,
     Quit,
 }
 
@@ -191,6 +197,10 @@ pub fn spawn_worker(
                     open_config(&path);
                 }
                 Cmd::OpenRepo => open_url(ui::REPO_URL),
+                Cmd::OpenResetSite => open_url(ui::RESET_SITE_URL),
+                Cmd::UseResetCard { week } => {
+                    use_reset_card_flow(&client, &state, week, &notify);
+                }
                 Cmd::Quit => {
                     std::process::exit(0);
                 }
@@ -288,10 +298,139 @@ fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>)
     ui.busy = None;
     ui.status = match result {
         Ok(_) if !ui.cfg.configured() => ui::Status::NoKey,
-        Ok(s) => ui::Status::Ok(s),
+        Ok(mut s) => {
+            // 顺带拉取重置卡余额，失败不影响主数据显示
+            s.resets = api::fetch_reset_cards(client, &ui.cfg).ok();
+            ui::Status::Ok(s)
+        }
         Err(_) if !ui.cfg.configured() => ui::Status::NoKey,
         Err(e) => ui::Status::Err(e),
     };
+}
+
+/// 使用重置卡流程：选最早过期的可用卡 → 确认弹窗 → 调用接口 → 刷新额度
+fn use_reset_card_flow(
+    client: &reqwest::blocking::Client,
+    state: &Arc<Mutex<UiState>>,
+    week: bool,
+    notify: &impl Fn(),
+) {
+    let kind = if week { "周额度" } else { "5小时额度" };
+    let picked = {
+        let ui = state.lock().unwrap();
+        match &ui.status {
+            ui::Status::Ok(s) => s.resets.as_ref().and_then(|r| r.pick(week).cloned()),
+            _ => None,
+        }
+    };
+    let Some(rec) = picked else {
+        set_busy(state, Some("没有可用的重置卡".into()));
+        notify();
+        return;
+    };
+
+    set_busy(state, Some(format!("等待确认（{kind}重置卡）…")));
+    notify();
+    let confirmed = confirm_dialog(
+        "GLMeter · 重置额度",
+        &format!(
+            "使用一张「{kind}」重置卡？\n\n对应额度将立即重置，操作不可撤销。\n卡片有效期至：{}",
+            rec.expire_time
+        ),
+    );
+    if !confirmed {
+        set_busy(state, None);
+        notify();
+        return;
+    }
+
+    set_busy(state, Some(format!("正在使用{kind}重置卡…")));
+    notify();
+    let cfg = config::load().0;
+    let request_id = api::new_request_id();
+    match api::use_reset_card(client, &cfg, week, rec.record_id, &request_id) {
+        Ok(()) => {
+            eprintln!(
+                "[GLMeter] 重置卡使用成功（{kind}，recordId={}）",
+                rec.record_id
+            );
+            worker_fetch(client, state);
+            notify();
+        }
+        Err(e) => {
+            set_busy(state, Some(format!("{kind}重置卡使用失败: {e}")));
+            notify();
+        }
+    }
+}
+
+/// 跨平台确认弹窗；无法弹出（无 osascript/zenity/kdialog）时返回 false，
+/// 宁可不执行也不静默消耗重置卡
+#[cfg(target_os = "macos")]
+fn confirm_dialog(title: &str, msg: &str) -> bool {
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "")
+    };
+    let script = format!(
+        "display dialog \"{}\" buttons {{\"取消\", \"确认使用\"}} default button \"确认使用\" cancel button \"取消\" with title \"{}\" with icon note",
+        esc(msg),
+        esc(title)
+    );
+    std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("button returned:确认使用")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn confirm_dialog(title: &str, msg: &str) -> bool {
+    use std::ffi::c_void;
+    const IDCANCEL: i32 = 2;
+    const MB_OKCANCEL: u32 = 0x1;
+    const MB_ICONQUESTION: u32 = 0x20;
+
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, utype: u32)
+            -> i32;
+    }
+
+    let text: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let id = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OKCANCEL | MB_ICONQUESTION,
+        )
+    };
+    id != IDCANCEL
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn confirm_dialog(title: &str, msg: &str) -> bool {
+    if let Ok(status) = std::process::Command::new("zenity")
+        .args(["--question", "--width=420", "--title", title, "--text", msg])
+        .status()
+    {
+        return status.success();
+    }
+    if let Ok(status) = std::process::Command::new("kdialog")
+        .args(["--yesno", msg, "--title", title])
+        .status()
+    {
+        return status.success();
+    }
+    eprintln!("[GLMeter] 未找到 zenity/kdialog，无法弹出确认框，已取消使用重置卡");
+    false
 }
 
 /// 5 小时窗口是否已激活（nextResetTime 可查且尚在有效期）。
@@ -793,6 +932,7 @@ mod tests {
                 }],
                 mcp: None,
                 fetched_at: Local::now(),
+                resets: None,
             };
             let state = Arc::new(Mutex::new(UiState::new(
                 Config::default(),

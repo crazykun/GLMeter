@@ -5,7 +5,10 @@
 //! - 纯 Rust DBus，无 GTK/libappindicator 依赖
 //! - 菜单按需拉取（DBusMenu），数据刷新不会导致重复注册
 
-use super::{UiState, ID_ACTIVATE, ID_CONFIG, ID_REFRESH, ID_REPO};
+use super::{
+    UiState, ID_ACTIVATE, ID_CONFIG, ID_REFRESH, ID_REPO, ID_RESET_SITE, ID_USE_RESET_5H,
+    ID_USE_RESET_WEEK,
+};
 use crate::ui;
 use crate::{spawn_ticker, spawn_worker, Cmd};
 use ksni::blocking::TrayMethods;
@@ -70,6 +73,9 @@ impl Tray for GlmTray {
                                 ID_REFRESH => Cmd::Fetch,
                                 ID_CONFIG => Cmd::OpenConfig,
                                 ID_REPO => Cmd::OpenRepo,
+                                ID_USE_RESET_5H => Cmd::UseResetCard { week: false },
+                                ID_USE_RESET_WEEK => Cmd::UseResetCard { week: true },
+                                ID_RESET_SITE => Cmd::OpenResetSite,
                                 _ => Cmd::Quit,
                             };
                             let _ = cmd_tx.send(cmd);
