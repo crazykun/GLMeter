@@ -506,6 +506,8 @@ fn about_icon_path() -> std::path::PathBuf {
 
 /// 按钮文字 → 链接（contains 匹配：zenity 输出裸标签，osascript 输出
 /// "button returned:标签"，两者都包含按钮文字）
+/// Windows 的 WinForms 在脚本内处理点击，不用此函数
+#[cfg(not(target_os = "windows"))]
 fn about_open(stdout: &str) {
     if stdout.contains("GLM 官网") {
         open_url(ui::USAGE_SITE_URL);
