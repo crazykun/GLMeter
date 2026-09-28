@@ -238,7 +238,7 @@ fn push_reset_entries(v: &mut Vec<MenuEntry>, s: &QuotaSnapshot, domestic: bool)
 }
 
 /// "2026-10-01 23:59:59" → "10-01 23:59"（异常格式原样返回）
-fn fmt_expire(s: &str) -> &str {
+pub(crate) fn fmt_expire(s: &str) -> &str {
     if s.len() >= 16 && s.as_bytes()[4] == b'-' {
         &s[5..16]
     } else {

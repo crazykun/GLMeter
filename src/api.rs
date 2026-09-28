@@ -49,7 +49,7 @@ pub struct ResetCards {
 }
 
 impl ResetCards {
-    fn list(&self, week: bool) -> &[ResetRecord] {
+    pub(crate) fn list(&self, week: bool) -> &[ResetRecord] {
         if week {
             &self.week
         } else {

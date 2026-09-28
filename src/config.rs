@@ -36,6 +36,44 @@ pub struct Config {
     /// 以触发 5h 窗口统计并获取 nextResetTime
     #[serde(default = "default_auto_activate")]
     pub auto_activate: bool,
+    /// 通知设置（[notify] 段，旧配置可整体省略）
+    #[serde(default)]
+    pub notify: NotifyConfig,
+}
+
+/// 重置卡提醒与通知渠道配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// 系统桌面通知（Windows toast / macOS 通知中心 / Linux notify-send）
+    pub desktop: bool,
+    /// 重置卡到期提醒阈值（剩余小时数，≤ 该值时提醒一次；每张卡每档只提醒一次）。
+    /// 空列表 = 关闭到期提醒
+    pub expire_hours: Vec<u64>,
+    /// 群机器人 Webhook 地址（企微 / 飞书 / 钉钉，按域名自动识别机器人类型）。
+    /// 识别规则：qyapi.weixin.qq.com → 企微；open.feishu.cn / open.larksuite.com → 飞书；
+    /// oapi.dingtalk.com / api.dingtalk.com → 钉钉。留空 = 不发送
+    pub hook_url: String,
+    /// 钉钉机器人加签密钥（安全设置选「加签」时必填，hook_url 非钉钉时忽略）
+    pub dingtalk_secret: String,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            desktop: true,
+            expire_hours: vec![24, 6, 1],
+            hook_url: String::new(),
+            dingtalk_secret: String::new(),
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// 是否有任何通知渠道启用
+    pub fn any_enabled(&self) -> bool {
+        self.desktop || !self.hook_url.trim().is_empty()
+    }
 }
 
 fn default_tray_title() -> String {
@@ -58,6 +96,7 @@ impl Default for Config {
             refresh_align: None,
             tray_title: default_tray_title(),
             auto_activate: default_auto_activate(),
+            notify: NotifyConfig::default(),
         }
     }
 }

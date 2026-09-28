@@ -1,6 +1,6 @@
 [package]
 name = "glmeter"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "GLM Coding Plan quota tray monitor (5-hour window & reset time)"
 license = "MIT"
@@ -15,6 +15,10 @@ toml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# 钉钉机器人加签（HMAC-SHA256）、Windows toast 的 PowerShell EncodedCommand 编码
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 # Linux: StatusNotifierItem 纯 Rust 实现（悬停 Title/ToolTip、自定义托盘文字）
 [target.'cfg(target_os = "linux")'.dependencies]

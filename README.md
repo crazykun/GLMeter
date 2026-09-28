@@ -21,6 +21,7 @@
 - ↻ **自动刷新**：默认每 5 分钟拉取一次配额，间隔可调（最小 1 分钟），可对齐整分网格；左键点击托盘立即刷新
 - ⏱ **倒计时实时**：菜单每 30 秒用当前数据重绘一次（不发请求），「xx分后」不会停在两次刷新之间
 - 🎁 **重置卡**：菜单直接显示可用张数，点击弹窗确认后使用最早过期的一张（5h / 周额度），免开官网
+- 🔔 **重置卡提醒**：到期提醒（剩余 24h / 6h / 1h 各提醒一次，阈值可配）+ 新增卡提醒（可用张数变多时），支持系统桌面通知与群机器人 Webhook（`[notify]` 配置段，单个 `hook_url` 按域名自动识别企微 / 飞书 / 钉钉）；提醒状态本地持久化，重启不重复提醒
 - 🔧 配置热加载：修改配置文件后无需重启
 - ↗ 菜单中仓库链接可点击，直接跳转 GitHub 页面
 - 🖥 `--check` 无界面模式，便于脚本化与调试（Windows 下 GUI 程序在终端运行时自动挂回控制台输出）
@@ -33,14 +34,16 @@ GLM Coding Plan · Lite 套餐
 5小时额度 ████████░░░░ 剩余 70%
   ↻ 重置 今天 19:20（17分后）
 ────────────────────────
-MCP 月额度 █████████░░ 13/100 次
+MCP 月额度 ██████████░░ 13/100 次
   · search-prime: 5 · zread: 7
   ↻ 重置 09-16 09:11
+────────────────────────
+↩ 重置卡恢复5小时额度（×6 · 最早 10-01 23:59 过期）
 ────────────────────────
 ⚡ 激活额度（发送 "1"）
 ↻ 立即刷新（更新于 19:03:12）
 ⚙ 打开配置文件
-↗ GLMeter v0.2.0 · github.com/crazykun/GLMeter
+↗ GLMeter v0.2.7 · github.com/crazykun/GLMeter
 ✕ 退出
 ```
 
@@ -127,6 +130,25 @@ activate_at = []
 #   {level} {5h_used} {5h_left} {5h_reset} {5h_countdown}
 #   {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}
 tray_title = "GLM {5h_left}%"
+
+# ── 重置卡提醒 ────────────────────────────────────────
+[notify]
+
+# 系统桌面通知（Windows toast / macOS 通知中心 / Linux notify-send），默认开
+desktop = true
+
+# 到期提醒阈值（小时）：重置卡剩余有效期 ≤ 该值时提醒一次，
+# 每张卡每档只提醒一次（防重复），空列表 [] 关闭到期提醒
+expire_hours = [24, 6, 1]
+
+# 群机器人 Webhook（可选，留空 = 不发送），按域名自动识别机器人类型：
+#   qyapi.weixin.qq.com   → 企业微信群机器人
+#   open.feishu.cn        → 飞书自定义机器人（国际版 open.larksuite.com 同样支持）
+#   oapi.dingtalk.com     → 钉钉自定义机器人
+# 消息以「GLMeter」开头，钉钉自定义关键词安全设置可直接填 GLMeter；
+# 钉钉选「加签」安全设置时另填 dingtalk_secret（其余平台忽略该项）
+hook_url = ""          # 如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+dingtalk_secret = ""
 ```
 
 也可用环境变量 `GLM_API_KEY` / `GLM_BASE_URL` 覆盖（适合 CI / 临时使用）。
@@ -157,6 +179,7 @@ MCP 月额度: 11/100 次（已用 11%）
 |---|---|
 | 配额查询 | `GET {base_url}/api/monitor/usage/quota/limit`（`Authorization: <api_key>`） |
 | 激活额度 | `POST {base_url}/api/coding/paas/v4/chat/completions`（Bearer，发送 `"1"`） |
+| 重置卡余额 / 使用 | `GET/POST {base_url}/api/biz/customer-package-reset`（Bearer） |
 
 - `TOKENS_LIMIT` → 5 小时窗口（Pro/Max 另有每周窗口），含 `percentage` 与 `nextResetTime`
 - `TIME_LIMIT` → MCP 月度额度

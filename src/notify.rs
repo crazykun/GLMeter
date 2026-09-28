@@ -1,0 +1,582 @@
+//! 重置卡提醒：
+//! - 到期提醒：剩余有效期跌破配置阈值（默认 24h/6h/1h）时各提醒一次
+//! - 新增提醒：可用张数比上次多时提醒
+//!
+//! 渠道：系统桌面通知（各平台原生）+ 可选 webhook 机器人（企业微信/飞书/钉钉）。
+//! 提醒状态持久化在配置目录 `notify_state.json`，重启不重复提醒、不误报「新增」。
+
+use crate::api::ResetCards;
+use crate::config::{Config, NotifyConfig};
+use chrono::Local;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::PathBuf;
+
+/// 去重/基线状态（配置目录 notify_state.json）
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
+struct NotifyState {
+    /// 上次见到的可用张数（kind → count）；首次见到只记基线、不提醒
+    counts: HashMap<String, usize>,
+    /// 已提醒过的到期阈值：record_id → 已提醒阈值（小时）
+    expire_alerted: HashMap<i64, Vec<u64>>,
+}
+
+/// 状态文件名（与 config.toml 同目录）
+const STATE_FILE: &str = "notify_state.json";
+
+fn state_path() -> PathBuf {
+    crate::config::config_path().with_file_name(STATE_FILE)
+}
+
+fn load_state_from(path: &PathBuf) -> NotifyState {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state_to(path: &PathBuf, st: &NotifyState) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let json = serde_json::to_string(st).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// 每次拉取到重置卡余额后调用：对比持久化状态，产生并发送提醒。
+/// 阻塞时长 = 桌面通知 + webhook 发送（仅在有提醒时发生），调用方须已释放状态锁。
+pub fn check(resets: Option<&ResetCards>, cfg: &Config) {
+    let Some(resets) = resets else { return };
+    if !cfg.notify.any_enabled() {
+        return;
+    }
+    let path = state_path();
+    let mut st = load_state_from(&path);
+    let mut lines = Vec::new();
+    lines.extend(expire_lines(resets, &cfg.notify, &mut st));
+    lines.extend(growth_lines(resets, &mut st));
+
+    // 先落盘再发送：宁可漏发也不重复轰炸（发送失败不回滚，避免每轮重试刷屏）
+    if let Err(e) = save_state_to(&path, &st) {
+        eprintln!("[GLMeter] 通知状态保存失败: {e}");
+        return;
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let title = "GLMeter · 重置卡提醒";
+    let body = lines.join("\n");
+    if cfg.notify.desktop {
+        send_desktop(title, &body);
+    }
+    send_webhooks(cfg, title, &body);
+}
+
+/// 到期提醒：找出本轮新跌破阈值的卡，按「类型+最紧急档位」分组，每组一行。
+/// 已到过期时间（阈值按 0 档）单独成组催用。
+/// 同轮跨过多个档位的卡只按最紧急的一档提醒，其余档位一并标记已提醒。
+fn expire_lines(resets: &ResetCards, n: &NotifyConfig, st: &mut NotifyState) -> Vec<String> {
+    let mut thresholds = n.expire_hours.clone();
+    thresholds.sort_unstable(); // 升序：小时数越小越紧急
+    thresholds.dedup();
+    if thresholds.is_empty() {
+        return Vec::new();
+    }
+    let now = Local::now();
+    // (类型, 紧急档位，0=已过期) →（张数, 最早过期时间字符串，同格式字典序即时间序）
+    let mut groups: BTreeMap<(bool, u64), (usize, String)> = BTreeMap::new();
+    for (week, _) in [(false, "5小时额度"), (true, "周额度")] {
+        for rec in resets.list(week).iter().filter(|r| r.available) {
+            let Some(expire) = parse_expire(&rec.expire_time) else {
+                continue;
+            };
+            let mins = (expire - now).num_minutes();
+            let crossed: Vec<u64> = thresholds
+                .iter()
+                .copied()
+                .filter(|h| mins <= (*h as i64) * 60)
+                .collect();
+            if crossed.is_empty() {
+                continue;
+            }
+            let alerted = st.expire_alerted.entry(rec.record_id).or_default();
+            let newly: Vec<u64> = crossed
+                .iter()
+                .copied()
+                .filter(|h| !alerted.contains(h))
+                .collect();
+            if newly.is_empty() {
+                continue;
+            }
+            alerted.extend(newly.iter());
+            let urgent = if mins <= 0 {
+                0
+            } else {
+                newly.iter().copied().min().unwrap()
+            };
+            let e = groups
+                .entry((week, urgent))
+                .or_insert((0, rec.expire_time.clone()));
+            e.0 += 1;
+            if rec.expire_time < e.1 {
+                e.1 = rec.expire_time.clone();
+            }
+        }
+    }
+    // 只保留仍可用的卡的记录，防止映射无限增长
+    let live_ids: Vec<i64> = [(false), (true)]
+        .iter()
+        .flat_map(|&week| resets.list(week).iter().filter(|r| r.available))
+        .map(|r| r.record_id)
+        .collect();
+    st.expire_alerted.retain(|id, _| live_ids.contains(id));
+
+    let labels = [(false, "5小时额度"), (true, "周额度")];
+    groups
+        .into_iter()
+        .map(|((week, urgent), (count, earliest))| {
+            let label = labels.iter().find(|(w, _)| *w == week).unwrap().1;
+            let exp = crate::ui::fmt_expire(&earliest);
+            if urgent == 0 {
+                format!("⏰ {label}重置卡×{count} 已到过期时间（{exp}），尽快使用")
+            } else {
+                format!("⏰ {label}重置卡×{count} 将在{urgent}小时内过期（最早 {exp} 过期）")
+            }
+        })
+        .collect()
+}
+
+/// 新增提醒：可用张数比上次记录多时提醒；减少/持平只静默更新基线
+fn growth_lines(resets: &ResetCards, st: &mut NotifyState) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (week, label, key) in [(false, "5小时额度", "5h"), (true, "周额度", "week")] {
+        let n = resets.available_count(week);
+        let prev = st.counts.insert(key.to_string(), n);
+        if let Some(p) = prev.filter(|p| *p < n) {
+            lines.push(format!("🎁 {label}重置卡 +{}（现有 {n} 张可用）", n - p));
+        }
+    }
+    lines
+}
+
+/// 服务端过期时间字符串（"2026-10-01 23:59:59"，官网按北京时间展示）按本机时区解析；
+/// 国内用户本机时区即北京时间，与官网显示一致
+fn parse_expire(s: &str) -> Option<chrono::DateTime<Local>> {
+    use chrono::TimeZone;
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|nd| Local.from_local_datetime(&nd).earliest())
+}
+
+// ── 桌面通知（各平台原生，与 confirm_dialog 同样的「外调命令」风格）────────
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn send_desktop(title: &str, body: &str) {
+    let ok = std::process::Command::new("notify-send")
+        .args(["-a", "GLMeter"])
+        .arg(title)
+        .arg(body)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("[GLMeter] 桌面通知失败（notify-send 不可用或被拒绝）");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_desktop(title: &str, body: &str) {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        esc(body),
+        esc(title)
+    );
+    let ok = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("[GLMeter] 桌面通知失败（osascript 不可用）");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn send_desktop(title: &str, body: &str) {
+    use base64::Engine;
+    use std::os::windows::process::CommandExt;
+
+    // Win10/11 原生 toast：借 PowerShell 自身的 AUMID 弹通知，无需安装模块
+    // （XML 文本节点转义 & < >，PS 单引号字符串再翻倍 '）
+    let xml = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\'', "''")
+    };
+    let script = format!(
+        r#"$ErrorActionPreference='SilentlyContinue'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime] | Out-Null
+$xml=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t=$xml.GetElementsByTagName('text')
+$t.Item(0).AppendChild($xml.CreateTextNode('{}')) | Out-Null
+$t.Item(1).AppendChild($xml.CreateTextNode('{}')) | Out-Null
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\WindowsPowerShell\v1.0\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($xml))"#,
+        xml(title),
+        xml(body),
+    );
+    let utf16le: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let enc = base64::engine::general_purpose::STANDARD.encode(utf16le);
+    let ok = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &enc])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW，避免闪黑框
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("[GLMeter] 桌面通知失败（PowerShell toast 不可用）");
+    }
+}
+
+// ── Webhook 机器人（单个 hook_url，按域名自动识别机器人类型）────────────
+
+/// 群机器人类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// 企业微信群机器人
+    Wecom,
+    /// 飞书自定义机器人
+    Feishu,
+    /// 钉钉自定义机器人
+    DingTalk,
+}
+
+impl Channel {
+    fn label(self) -> &'static str {
+        match self {
+            Channel::Wecom => "企微",
+            Channel::Feishu => "飞书",
+            Channel::DingTalk => "钉钉",
+        }
+    }
+
+    /// 按 hook URL 域名识别（域名后缀匹配，忽略大小写；
+    /// 覆盖国内站与国际版 larksuite / dingtalk）
+    fn detect(url: &str) -> Option<Channel> {
+        let u = url.to_ascii_lowercase();
+        if u.contains("weixin.qq.com") {
+            Some(Channel::Wecom)
+        } else if u.contains("feishu.cn") || u.contains("larksuite.com") {
+            Some(Channel::Feishu)
+        } else if u.contains("dingtalk.com") {
+            Some(Channel::DingTalk)
+        } else {
+            None
+        }
+    }
+
+    /// 各平台 text 消息体（企微与钉钉同构，飞书字段名不同）
+    fn payload(self, text: &str) -> serde_json::Value {
+        match self {
+            Channel::Wecom | Channel::DingTalk => {
+                serde_json::json!({"msgtype":"text","text":{"content": text}})
+            }
+            Channel::Feishu => serde_json::json!({"msg_type":"text","content":{"text": text}}),
+        }
+    }
+}
+
+fn send_webhooks(cfg: &Config, title: &str, body: &str) {
+    let url = cfg.notify.hook_url.trim();
+    if url.is_empty() {
+        return;
+    }
+    let Some(channel) = Channel::detect(url) else {
+        eprintln!("[GLMeter] hook_url 域名无法识别机器人类型（支持企微/飞书/钉钉）: {url}");
+        return;
+    };
+    // 钉钉加签：安全设置选「加签」时必填 dingtalk_secret，其余平台忽略
+    let url = if channel == Channel::DingTalk {
+        match cfg.notify.dingtalk_secret.trim() {
+            "" => url.to_string(),
+            secret => dingtalk_signed(url, secret, &chrono::Utc::now()),
+        }
+    } else {
+        url.to_string()
+    };
+    // 以 GLMeter 开头：钉钉自定义关键词安全设置可直接用「GLMeter」
+    let text = format!("【{title}】\n{body}");
+    let client = reqwest::blocking::Client::new();
+    let payload = channel.payload(&text);
+    webhook_result(channel.label(), post_json(&client, &url, &payload));
+}
+
+fn post_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    payload: &serde_json::Value,
+) -> Result<String, String> {
+    let resp = client
+        .post(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(payload)
+        .send()
+        .map_err(|e| format!("网络错误: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", truncate(&body, 120)));
+    }
+    Ok(body)
+}
+
+/// 各平台返回码统一检查：errcode/code/StatusCode == 0 视为成功，否则记日志
+fn webhook_result(kind: &str, result: Result<String, String>) {
+    match result {
+        Err(e) => eprintln!("[GLMeter] {kind}通知发送失败: {e}"),
+        Ok(body) => {
+            let code = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("errcode")
+                        .or_else(|| v.get("code"))
+                        .or_else(|| v.get("StatusCode"))
+                        .and_then(|c| c.as_i64())
+                });
+            if code != Some(0) {
+                eprintln!("[GLMeter] {kind}通知被拒: {}", truncate(&body, 200));
+            }
+        }
+    }
+}
+
+/// 按字符数截断（直接按字节切会把中文切成非法 UTF-8 导致 panic）
+fn truncate(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+/// 钉钉加签 URL：sign = urlencode(base64(HMAC-SHA256(secret, "{timestamp}\n{secret}")))
+fn dingtalk_signed(hook: &str, secret: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
+    let ts = now.timestamp_millis();
+    format!("{hook}&timestamp={ts}&sign={}", dingtalk_sign(secret, ts))
+}
+
+fn dingtalk_sign(secret: &str, ts: i64) -> String {
+    use base64::Engine;
+    use hmac::Mac;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("hmac 任意长度密钥");
+    mac.update(format!("{ts}\n{secret}").as_bytes());
+    base64::engine::general_purpose::STANDARD
+        .encode(mac.finalize().into_bytes())
+        .replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ResetRecord;
+    use chrono::Duration;
+
+    fn cards(entries: &[(i64, &str, bool)]) -> ResetCards {
+        ResetCards {
+            five_hour: entries
+                .iter()
+                .map(|(id, exp, av)| ResetRecord {
+                    record_id: *id,
+                    expire_time: exp.to_string(),
+                    available: *av,
+                })
+                .collect(),
+            week: Vec::new(),
+        }
+    }
+
+    fn expire_at(hours: f64) -> String {
+        (Local::now() + Duration::minutes((hours * 60.0) as i64))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    fn notify_cfg(hours: &[u64]) -> NotifyConfig {
+        NotifyConfig {
+            expire_hours: hours.to_vec(),
+            desktop: false,
+            ..NotifyConfig::default()
+        }
+    }
+
+    #[test]
+    fn expire_alerts_fire_once_per_level() {
+        let n = notify_cfg(&[24, 6, 1]);
+        let mut st = NotifyState::default();
+
+        // 剩余 5h：同时跨过 24h 和 6h 两档 → 只按最紧急的 6h 提醒一次
+        let r = cards(&[(1, &expire_at(5.0), true)]);
+        let lines = expire_lines(&r, &n, &mut st);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("将在6小时内过期"), "{lines:?}");
+
+        // 同一状态再查 → 不重复提醒
+        assert!(expire_lines(&r, &n, &mut st).is_empty());
+
+        // 跌破 1h → 追加 1h 提醒
+        let r2 = cards(&[(1, &expire_at(0.5), true)]);
+        let lines = expire_lines(&r2, &n, &mut st);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("将在1小时内过期"), "{lines:?}");
+        assert!(expire_lines(&r2, &n, &mut st).is_empty());
+    }
+
+    #[test]
+    fn expire_groups_same_level_cards() {
+        let n = notify_cfg(&[24]);
+        let mut st = NotifyState::default();
+        let r = cards(&[
+            (1, &expire_at(10.0), true),
+            (2, &expire_at(20.0), true),
+            (3, &expire_at(30.0), false), // 已用掉的卡不提醒
+        ]);
+        let lines = expire_lines(&r, &n, &mut st);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("×2"), "{lines:?}");
+        // 最早过期时间取字典序最小者（10 小时那张）
+        assert!(lines[0].contains(&expire_at(10.0)[5..16]), "{lines:?}");
+    }
+
+    #[test]
+    fn expired_but_available_card_is_urgent() {
+        let n = notify_cfg(&[24, 6, 1]);
+        let mut st = NotifyState::default();
+        let r = cards(&[(1, &expire_at(-0.1), true)]);
+        let lines = expire_lines(&r, &n, &mut st);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("已到过期时间"), "{lines:?}");
+        assert!(expire_lines(&r, &n, &mut st).is_empty());
+    }
+
+    #[test]
+    fn growth_alerts_only_on_increase() {
+        let mut st = NotifyState::default();
+        // 首次见到 → 只记基线
+        assert!(growth_lines(&cards(&[(1, "", true)]), &mut st).is_empty());
+        // 1 → 3 → 提醒 +2
+        let lines = growth_lines(
+            &cards(&[(1, "", true), (2, "", true), (3, "", true)]),
+            &mut st,
+        );
+        assert_eq!(lines, vec!["🎁 5小时额度重置卡 +2（现有 3 张可用）"]);
+        // 减少 → 静默
+        assert!(growth_lines(&cards(&[(1, "", true)]), &mut st).is_empty());
+        // 回升 → 再提醒
+        let lines = growth_lines(&cards(&[(1, "", true), (4, "", true)]), &mut st);
+        assert_eq!(lines, vec!["🎁 5小时额度重置卡 +1（现有 2 张可用）"]);
+    }
+
+    #[test]
+    fn state_serializes_losslessly() {
+        let mut st = NotifyState::default();
+        st.counts.insert("5h".into(), 3);
+        st.expire_alerted.insert(42, vec![24, 6]);
+        let json = serde_json::to_string(&st).unwrap();
+        let back: NotifyState = serde_json::from_str(&json).unwrap();
+        assert_eq!(st, back);
+    }
+
+    #[test]
+    fn parse_expire_handles_server_format() {
+        let dt = parse_expire("2026-10-01 23:59:59").unwrap();
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-10-01 23:59:59"
+        );
+        assert!(parse_expire("garbage").is_none());
+        assert!(parse_expire("").is_none());
+    }
+
+    #[test]
+    fn dingtalk_sign_matches_reference_vector() {
+        // python3: base64(hmac_sha256("SEC1234567890abcdef", "1700000000000\nSEC1234567890abcdef"))
+        assert_eq!(
+            dingtalk_sign("SEC1234567890abcdef", 1_700_000_000_000),
+            "RqBq3E1RTBDv3n2QBCh4adZ2WHk9mVklyUoDBLxarjI%3D"
+        );
+    }
+
+    #[test]
+    fn dingtalk_signed_url_appends_timestamp_and_urlencoded_sign() {
+        let now = chrono::Utc::now();
+        let url = dingtalk_signed(
+            "https://oapi.dingtalk.com/robot/send?access_token=abc",
+            "SECxxx",
+            &now,
+        );
+        let prefix = format!(
+            "https://oapi.dingtalk.com/robot/send?access_token=abc&timestamp={}&sign=",
+            now.timestamp_millis()
+        );
+        assert!(url.starts_with(&prefix), "{url}");
+        // 签名已 URL 编码：不含裸的 + / =
+        let sign = &url[prefix.len()..];
+        assert!(!sign.is_empty());
+        assert!(sign
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'%' || b == b'-' || b == b'_'));
+    }
+
+    #[test]
+    fn channel_detected_by_domain() {
+        assert_eq!(
+            Channel::detect("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc"),
+            Some(Channel::Wecom)
+        );
+        assert_eq!(
+            Channel::detect("https://open.feishu.cn/open-apis/bot/v2/hook/abc"),
+            Some(Channel::Feishu)
+        );
+        // 飞书国际版
+        assert_eq!(
+            Channel::detect("https://open.larksuite.com/open-apis/bot/v2/hook/abc"),
+            Some(Channel::Feishu)
+        );
+        assert_eq!(
+            Channel::detect("https://oapi.dingtalk.com/robot/send?access_token=abc"),
+            Some(Channel::DingTalk)
+        );
+        // 未知域名 / 空串 → 不发送
+        assert_eq!(Channel::detect("https://example.com/hook"), None);
+        assert_eq!(Channel::detect(""), None);
+    }
+
+    #[test]
+    fn channel_payload_shapes() {
+        let t = "hi";
+        let wecom = Channel::Wecom.payload(t);
+        assert_eq!(
+            (wecom["msgtype"].as_str(), wecom["text"]["content"].as_str()),
+            (Some("text"), Some(t))
+        );
+        let feishu = Channel::Feishu.payload(t);
+        assert_eq!(
+            (
+                feishu["msg_type"].as_str(),
+                feishu["content"]["text"].as_str()
+            ),
+            (Some("text"), Some(t))
+        );
+        let ding = Channel::DingTalk.payload(t);
+        assert_eq!(
+            (ding["msgtype"].as_str(), ding["text"]["content"].as_str()),
+            (Some("text"), Some(t))
+        );
+    }
+}
