@@ -29,8 +29,15 @@ pub enum Cmd {
         week: bool,
     },
     OpenConfig,
-    OpenRepo,
-    /// 打开官网重置卡管理页
+    /// 弹出关于窗口（版本 + 官网用量 / 邀请注册 / GitHub 入口）
+    About,
+    /// 检查更新（manual = 菜单点击，显示 busy 与结果；auto = 定时静默检查）
+    CheckUpdate {
+        manual: bool,
+    },
+    /// 打开 Release 页（更新入口）
+    OpenReleases,
+    /// 打开官网用量统计页
     OpenResetSite,
     /// 仅重绘（菜单倒计时节拍），不发网络请求
     Render,
@@ -199,8 +206,31 @@ pub fn spawn_worker(
                     let path = state.lock().unwrap().cfg_path.clone();
                     open_config(&path);
                 }
-                Cmd::OpenRepo => open_url(ui::REPO_URL),
-                Cmd::OpenResetSite => open_url(ui::RESET_SITE_URL),
+                Cmd::OpenResetSite => open_url(ui::USAGE_SITE_URL),
+                Cmd::About => show_about(),
+                Cmd::CheckUpdate { manual } => {
+                    if manual {
+                        set_busy(&state, Some("检查更新中…".into()));
+                        notify();
+                    }
+                    check_update(&client, &state, manual);
+                    notify();
+                }
+                Cmd::OpenReleases => {
+                    // 优先跳被提醒的那个版本页（API 已带回精确 URL），
+                    // 无记录时退回 releases/latest
+                    let url = state
+                        .lock()
+                        .unwrap()
+                        .update
+                        .as_ref()
+                        .and_then(|i| match &i.status {
+                            ui::UpdateStatus::Newer { url, .. } => Some(url.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| ui::RELEASES_URL.to_string());
+                    open_url(&url);
+                }
                 Cmd::Render => notify(),
                 Cmd::UseResetCard { week } => {
                     use_reset_card_flow(&client, &state, week, &notify);
@@ -367,6 +397,8 @@ fn use_reset_card_flow(
                 "[GLMeter] 重置卡使用成功（{kind}，recordId={}）",
                 rec.record_id
             );
+            // 登记自己刚用掉的卡：随后的刷新里不计入「已使用」提醒
+            notify::mark_self_used(rec.record_id);
             worker_fetch(client, state);
             notify();
         }
@@ -446,6 +478,255 @@ fn confirm_dialog(title: &str, msg: &str) -> bool {
     false
 }
 
+// ── 关于窗口：logo + 版本号 + 说明 + 四个按钮（GitHub 地址 / GLM 官网 / GLM 注册 / 确定）──
+// 不显示 URL，点按钮在浏览器打开对应链接；
+// Windows 由脚本内响应点击，macOS/Linux 起线程等用户选择，均不阻塞 worker
+
+fn show_about() {
+    #[cfg(target_os = "windows")]
+    {
+        show_about_windows();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::thread::spawn(show_about_macos);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::thread::spawn(show_about_linux);
+    }
+}
+
+/// 把内嵌 logo 写到临时目录供关于窗口引用（重复弹出直接覆盖）
+fn about_icon_path() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join("glmeter-about.png");
+    let _ = std::fs::write(&p, include_bytes!("../assets/icon.png"));
+    p
+}
+
+/// 按钮文字 → 链接（contains 匹配：zenity 输出裸标签，osascript 输出
+/// "button returned:标签"，两者都包含按钮文字）
+fn about_open(stdout: &str) {
+    if stdout.contains("GLM 官网") {
+        open_url(ui::USAGE_SITE_URL);
+    } else if stdout.contains("GLM 注册") {
+        open_url(ui::INVITE_URL);
+    } else if stdout.contains("GitHub") {
+        open_url(ui::REPO_URL);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_about_windows() {
+    use std::os::windows::process::CommandExt;
+
+    // WinForms 窗口：logo + 三个入口按钮 + 确定收尾；
+    // URL 放在按钮 Tag 里，点击 Process.Start，确定直接关窗
+    let script = std::env::temp_dir().join("glmeter-about.ps1");
+    let ps = r#"param($Ver, $Icon, $Repo, $Usage, $Invite)
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$f=New-Object System.Windows.Forms.Form
+$f.Text='关于 GLMeter'
+$f.Size=New-Object System.Drawing.Size(484,205)
+$f.FormBorderStyle=[System.Windows.Forms.FormBorderStyle]::FixedDialog
+$f.StartPosition='CenterScreen'
+$f.MaximizeBox=$false
+$pb=New-Object System.Windows.Forms.PictureBox
+$pb.Image=[System.Drawing.Image]::FromFile($Icon)
+$pb.Location=New-Object System.Drawing.Point(24,22)
+$pb.Size=New-Object System.Drawing.Size(72,72)
+$pb.SizeMode='Zoom'
+$f.Controls.Add($pb)
+$t=New-Object System.Windows.Forms.Label
+$t.Text='GLMeter v'+$Ver
+$t.Font=New-Object System.Drawing.Font('Microsoft YaHei UI',14,[System.Drawing.FontStyle]::Bold)
+$t.AutoSize=$true
+$t.Location=New-Object System.Drawing.Point(110,30)
+$f.Controls.Add($t)
+$s=New-Object System.Windows.Forms.Label
+$s.Text='GLM Coding Plan 配额托盘监控工具'
+$s.AutoSize=$true
+$s.Location=New-Object System.Drawing.Point(112,68)
+$f.Controls.Add($s)
+function B($txt,$url,$x){
+  $k=New-Object System.Windows.Forms.Button
+  $k.Text=$txt
+  $k.Tag=$url
+  $k.Size=New-Object System.Drawing.Size(104,34)
+  $k.Location=New-Object System.Drawing.Point($x,126)
+  $k.add_Click({param($a,$e) if($a.Tag){[System.Diagnostics.Process]::Start($a.Tag)|Out-Null}else{$a.FindForm().Close()}})
+  $f.Controls.Add($k)
+}
+B 'GitHub 地址' $Repo 20
+B 'GLM 官网' $Usage 132
+B 'GLM 注册' $Invite 244
+B '确定' '' 356
+[void]$f.ShowDialog()"#;
+    let icon = about_icon_path();
+    if std::fs::write(&script, ps).is_ok() {
+        let ok = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .args(["-Ver", ui::VERSION])
+            .arg("-Icon")
+            .arg(&icon)
+            .args(["-Repo", ui::REPO_URL])
+            .args(["-Usage", ui::USAGE_SITE_URL])
+            .args(["-Invite", ui::INVITE_URL])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .is_ok();
+        if ok {
+            return;
+        }
+    }
+    eprintln!("[GLMeter] 关于窗口弹出失败（PowerShell 不可用）");
+}
+
+#[cfg(target_os = "macos")]
+fn show_about_macos() {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let text = format!("GLMeter v{}\nGLM Coding Plan 配额托盘监控工具", ui::VERSION);
+    // macOS 对话框最多 3 个按钮，无独立「确定」（Esc 关闭）；按钮顺序固定，
+    // 最右为默认（GLM 官网）
+    let buttons = r#"buttons {"GitHub 地址", "GLM 注册", "GLM 官网"} default button "GLM 官网""#;
+    let title = r#"with title "关于 GLMeter""#;
+    let run_osascript = |script: String| {
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+    };
+    // 优先带 logo（自定义 png）；弹出失败且非用户主动取消时退回系统图标
+    let with_icon = format!(
+        "display dialog \"{}\" {} {} with icon file (POSIX file \"{}\")",
+        esc(&text),
+        buttons,
+        title,
+        about_icon_path().display()
+    );
+    if let Ok(out) = run_osascript(with_icon) {
+        if out.status.success() {
+            about_open(String::from_utf8_lossy(&out.stdout).trim());
+            return;
+        }
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        if err.contains("cancel") || err.contains("取消") {
+            return; // 用户主动关闭
+        }
+    }
+    let plain = format!(
+        "display dialog \"{}\" {} {} with icon note",
+        esc(&text),
+        buttons,
+        title
+    );
+    if let Ok(out) = run_osascript(plain) {
+        if out.status.success() {
+            about_open(String::from_utf8_lossy(&out.stdout).trim());
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn show_about_linux() {
+    // 首选系统 python3/GTK（主流桌面发行版自带）：logo 大图 + 按钮顺序可控（确定在最后）
+    let icon = about_icon_path();
+    let script = std::env::temp_dir().join("glmeter-about.py");
+    let py = r#"import sys, subprocess
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, GdkPixbuf
+except Exception:
+    sys.exit(3)
+
+VER = sys.argv[1] if len(sys.argv) > 1 else ""
+ICON = sys.argv[2] if len(sys.argv) > 2 else ""
+LINKS = [
+    ("GitHub 地址", "REPO_URL"),
+    ("GLM 官网", "USAGE_URL"),
+    ("GLM 注册", "INVITE_URL"),
+]
+
+d = Gtk.MessageDialog(
+    title="关于 GLMeter",
+    message_type=Gtk.MessageType.INFO,
+    buttons=Gtk.ButtonsType.NONE,
+    text="GLMeter v" + VER,
+    secondary_text="GLM Coding Plan 配额托盘监控工具",
+)
+try:
+    pb = GdkPixbuf.Pixbuf.new_from_file_at_size(ICON, 72, 72)
+    img = Gtk.Image.new_from_pixbuf(pb)
+    d.set_image(img)
+except Exception:
+    pass
+for i, (label, _) in enumerate(LINKS):
+    d.add_button(label, 100 + i)
+d.add_button("确定", Gtk.ResponseType.OK)
+# 无父窗口时 WM 可能把对话框放到左上角，强制屏幕居中
+d.set_position(Gtk.WindowPosition.CENTER)
+d.show_all()
+r = d.run()
+if 100 <= r < 100 + len(LINKS):
+    # Deepin 的 xdg-open→dde-open 会丢 URL，gio open 正常（与 Rust open_url 同策略）
+    for cmd in (["gio", "open", LINKS[r - 100][1]], ["xdg-open", LINKS[r - 100][1]]):
+        try:
+            subprocess.Popen(cmd)
+            break
+        except Exception:
+            continue
+d.destroy()"#
+        .replace("REPO_URL", ui::REPO_URL)
+        .replace("USAGE_URL", ui::USAGE_SITE_URL)
+        .replace("INVITE_URL", ui::INVITE_URL);
+    if std::fs::write(&script, py).is_ok() {
+        let ok = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(ui::VERSION)
+            .arg(&icon)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+    }
+    // zenity 兜底：logo 显示在文字左侧，但「确定」会被 GTK 排在最前（顺序不可控）
+    let text = format!("GLMeter v{}\nGLM Coding Plan 配额托盘监控工具", ui::VERSION);
+    if let Ok(out) = std::process::Command::new("zenity")
+        .args([
+            "--info",
+            "--title",
+            "关于 GLMeter",
+            "--width",
+            "420",
+            "--height",
+            "190",
+        ])
+        .arg("--text")
+        .arg(&text)
+        .arg("--icon")
+        .arg(&icon)
+        .args([
+            "--extra-button=GitHub 地址",
+            "--extra-button=GLM 官网",
+            "--extra-button=GLM 注册",
+        ])
+        .output()
+    {
+        if out.status.success() {
+            about_open(String::from_utf8_lossy(&out.stdout).trim());
+        }
+        return;
+    }
+    // 无 python-gi/zenity：退回直接打开 GitHub 仓库
+    eprintln!("[GLMeter] 关于窗口不可用（缺 python3-gi / zenity），直接打开 GitHub 仓库");
+    open_url(ui::REPO_URL);
+}
+
 /// 5 小时窗口是否已激活（nextResetTime 可查且尚在有效期）。
 /// 安全边际 90 秒：刚激活的新窗口 reset = now+5h 必然通过；
 /// 垂死/刚过期的旧窗口（reset ≤ now+90s）视为未生效 → 触发重试，
@@ -473,7 +754,152 @@ fn set_busy(state: &Arc<Mutex<UiState>>, msg: Option<String>) {
 pub fn spawn_ticker(cmd: mpsc::Sender<Cmd>) {
     spawn_interval_ticker(cmd.clone());
     spawn_daily_activate(cmd.clone());
-    spawn_render_ticker(cmd);
+    spawn_render_ticker(cmd.clone());
+    spawn_update_checker(cmd);
+}
+
+// ── 更新检查：GitHub Release 对比 + 24h 自动检查 + 新版本提醒 ────────────
+
+/// 自动检查间隔；线程每 6 小时醒来，距上次检查 ≥24h 才真正发起
+const UPDATE_CHECK_INTERVAL: chrono::TimeDelta = chrono::Duration::hours(24);
+const UPDATE_CHECK_POLL_SECS: u64 = 6 * 3600;
+
+/// 更新检查的持久化状态（配置目录 update_state.json）：
+/// last_check 防止重启后重复检查；notified 记录已提醒过的版本，重启不重复通知
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UpdateState {
+    #[serde(default)]
+    last_check: Option<String>,
+    #[serde(default)]
+    notified: Option<String>,
+}
+
+fn update_state_path() -> std::path::PathBuf {
+    config::config_path().with_file_name("update_state.json")
+}
+
+fn load_update_state() -> UpdateState {
+    std::fs::read_to_string(update_state_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_update_state(st: &UpdateState) {
+    let path = update_state_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(st) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// 距上次检查是否已达间隔（无记录 = 到期）
+fn update_check_due_at(
+    last_check: Option<chrono::DateTime<chrono::Local>>,
+    now: chrono::DateTime<chrono::Local>,
+) -> bool {
+    last_check
+        .map(|t| now - t >= UPDATE_CHECK_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn update_check_due() -> bool {
+    let last = load_update_state().last_check.and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Local))
+    });
+    update_check_due_at(last, chrono::Local::now())
+}
+
+/// 记录一次检查：刷新 last_check；发现新版本且未提醒过 → 返回 true（应提醒）。
+/// 检查失败也记 last_check，避免 GitHub 不可达时每 6 小时空转重试
+fn record_update_check(newer_tag: Option<&str>) -> bool {
+    let mut st = load_update_state();
+    st.last_check = Some(chrono::Local::now().to_rfc3339());
+    let fire = match newer_tag {
+        Some(tag) if st.notified.as_deref() != Some(tag) => {
+            st.notified = Some(tag.to_string());
+            true
+        }
+        _ => false,
+    };
+    save_update_state(&st);
+    fire
+}
+
+/// "v0.2.9-rc1" → (0,2,9)；解析失败返回 None（按不更新处理）
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let mut it = s.trim().trim_start_matches('v').split(&['.', '-', '+'][..]);
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// candidate 是否比 current 新（任一解析失败 = 不更新）
+fn version_newer(candidate: &str, current: &str) -> bool {
+    match (parse_semver(candidate), parse_semver(current)) {
+        (Some(c), Some(cur)) => c > cur,
+        _ => false,
+    }
+}
+
+/// 执行一次更新检查并更新 UI 状态；发现新版本时推提醒（每版本仅一次）
+fn check_update(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>, manual: bool) {
+    let cfg = config::load().0;
+    let result = api::fetch_latest_release(client);
+    let mut newer_tag = None;
+    let status = match &result {
+        Ok(r) if version_newer(&r.tag, ui::VERSION) => {
+            newer_tag = Some(r.tag.clone());
+            ui::UpdateStatus::Newer {
+                latest: r.tag.trim_start_matches('v').to_string(),
+                url: if r.url.is_empty() {
+                    ui::RELEASES_URL.to_string()
+                } else {
+                    r.url.clone()
+                },
+            }
+        }
+        Ok(_) => ui::UpdateStatus::Latest,
+        Err(e) => ui::UpdateStatus::Failed(e.chars().take(60).collect()),
+    };
+    if record_update_check(newer_tag.as_deref()) {
+        let latest = newer_tag.as_deref().unwrap_or_default();
+        notify::push(
+            "GLMeter · 发现新版本",
+            &format!(
+                "v{} 可用（当前 v{}）\n菜单中点击「查看更新」跳转 Release 页",
+                latest.trim_start_matches('v'),
+                ui::VERSION
+            ),
+            &cfg,
+        );
+    }
+    if manual {
+        set_busy(state, None);
+    }
+    state.lock().unwrap().update = Some(ui::UpdateInfo {
+        checked_at: chrono::Local::now(),
+        status,
+    });
+}
+
+/// 启动 90 秒后做首轮检查，此后每 6 小时醒来评估是否到期（≥24h）；
+/// 手动检查同样落盘 last_check，两处共用同一节流
+fn spawn_update_checker(cmd: mpsc::Sender<Cmd>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(90));
+        loop {
+            if update_check_due() {
+                let _ = cmd.send(Cmd::CheckUpdate { manual: false });
+            }
+            std::thread::sleep(std::time::Duration::from_secs(UPDATE_CHECK_POLL_SECS));
+        }
+    });
 }
 
 /// 渲染节拍间隔：倒计时精度以分钟计，30 秒足够跟上显示
@@ -707,6 +1133,16 @@ pub fn open_url(url: &str) {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // Deepin 的 xdg-open 路由到 dde-open 后会丢失 URL（只激活浏览器不跳转，
+        // 对自定义浏览器 Exec=%U 替换失败）；gio open 走 GAppInfo 路径替换正确。
+        // 优先 gio，无 gio 时退回 xdg-open
+        if std::process::Command::new("gio")
+            .args(["open", url])
+            .spawn()
+            .is_ok()
+        {
+            return;
+        }
         std::process::Command::new("xdg-open").arg(url).spawn().ok();
     }
 }
@@ -979,6 +1415,37 @@ mod tests {
             Local::now() - Duration::minutes(1)
         ))));
         assert!(!window_active(&mk(None)));
+    }
+
+    #[test]
+    fn semver_newer_comparison() {
+        use super::{parse_semver, version_newer};
+        assert_eq!(parse_semver("v0.2.9"), Some((0, 2, 9)));
+        assert_eq!(parse_semver("0.10.0"), Some((0, 10, 0)));
+        // 预发布后缀取前导数字
+        assert_eq!(parse_semver("v1.0.0-rc1"), Some((1, 0, 0)));
+        assert!(parse_semver("garbage").is_none());
+
+        assert!(version_newer("v0.2.9", "0.2.8"));
+        assert!(version_newer("v1.0.0", "0.99.99"));
+        // 进位比较而非字符串比较
+        assert!(version_newer("v0.10.0", "0.9.9"));
+        assert!(!version_newer("v0.2.8", "0.2.8"));
+        assert!(!version_newer("v0.2.7", "0.2.8"));
+        // 解析失败一律不提示更新
+        assert!(!version_newer("latest", "0.2.8"));
+    }
+
+    #[test]
+    fn update_due_by_interval() {
+        use super::update_check_due_at;
+        let now = Local::now();
+        // 无记录 → 到期
+        assert!(update_check_due_at(None, now));
+        // 刚检查过 → 未到期
+        assert!(!update_check_due_at(Some(now - Duration::hours(23)), now));
+        // 超过 24h → 到期
+        assert!(update_check_due_at(Some(now - Duration::hours(25)), now));
     }
 
     #[test]

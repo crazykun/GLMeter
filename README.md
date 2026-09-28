@@ -21,9 +21,10 @@
 - ↻ **自动刷新**：默认每 5 分钟拉取一次配额，间隔可调（最小 1 分钟），可对齐整分网格；左键点击托盘立即刷新
 - ⏱ **倒计时实时**：菜单每 30 秒用当前数据重绘一次（不发请求），「xx分后」不会停在两次刷新之间
 - 🎁 **重置卡**：菜单直接显示可用张数，点击弹窗确认后使用最早过期的一张（5h / 周额度），免开官网
-- 🔔 **重置卡提醒**：到期提醒（剩余 24h / 6h / 1h 各提醒一次，阈值可配）+ 新增卡提醒（可用张数变多时），支持系统桌面通知与群机器人 Webhook（`[notify]` 配置段，单个 `hook_url` 按域名自动识别企微 / 飞书 / 钉钉）；提醒状态本地持久化，重启不重复提醒
+- 🔔 **重置卡提醒**：到期提醒（剩余 24h / 6h / 1h 各提醒一次，阈值可配）+ 变动提醒（新增卡到账；减少时能区分「已使用」与「过期作废」——依据 `expireTime` 是否已到和上次用卡时间是否变化，GLMeter 自己用卡不提醒），支持系统桌面通知与群机器人 Webhook（`[notify]` 配置段，单个 `hook_url` 按域名自动识别企微 / 飞书 / 钉钉）；提醒状态本地持久化，重启不重复提醒
+- 🆕 **更新检查**：启动后自动检查一次 GitHub 最新 Release，此后每 24 小时一次；也可随时点菜单「检查更新」。发现新版本时桌面通知/群机器人提醒，菜单出现「🆕 新版本 vX 可用 · 查看更新」一键跳转对应 Release 页。仅请求 GitHub 公开 API，不发送任何本机数据
+- ℹ **关于窗口**：菜单底部「关于 GLMeter」弹原生窗口——GLMeter logo + 版本号 + 简介，按钮：GitHub 地址 / GLM 官网（用量统计）/ GLM 注册 / 确定，点入口按钮在浏览器打开对应页面
 - 🔧 配置热加载：修改配置文件后无需重启
-- ↗ 菜单中仓库链接可点击，直接跳转 GitHub 页面
 - 🖥 `--check` 无界面模式，便于脚本化与调试（Windows 下 GUI 程序在终端运行时自动挂回控制台输出）
 
 ## 截图（菜单示意）
@@ -43,7 +44,9 @@ MCP 月额度 ██████████░░ 13/100 次
 ⚡ 激活额度（发送 "1"）
 ↻ 立即刷新（更新于 19:03:12）
 ⚙ 打开配置文件
-↗ GLMeter v0.2.7 · github.com/crazykun/GLMeter
+────────────────────────
+🆕 检查更新（✓ 已是最新 v0.2.8）
+ℹ 关于 GLMeter v0.2.8
 ✕ 退出
 ```
 
@@ -79,6 +82,8 @@ cargo build --release
 ### Linux 已知说明
 
 - 托盘基于 StatusNotifierItem(DBus) 协议（ksni 纯 Rust 实现）：悬停显示详情提示，左键点击立即刷新，托盘文字由 `tray_title` 模板自定义
+- Deepin（dde-tray-loader / dde-dock）的悬停提示只读 SNI ToolTip 的 title 单字段，GLMeter 已把全部明细合并进该字段以兼容；KDE Plasma 双字段都渲染，因此 description 留空避免重复
+- Deepin 的 `xdg-open` 经 `dde-open` 打开 URL 时会丢失链接参数（只激活浏览器不跳转）；GLMeter 在 Linux 上优先用 `gio open` 打开链接规避，无 gio 时退回 xdg-open
 - dock/panel 重启导致 watcher 离线时自动重连，无需重启 GLMeter
 - GLMeter 使用单实例锁（`instance.lock`），重复启动会直接退出
 - 若托盘长时间不显示，可尝试重启 dock/panel（如 Deepin 的 dde-dock）后重新运行
@@ -180,6 +185,7 @@ MCP 月额度: 11/100 次（已用 11%）
 | 配额查询 | `GET {base_url}/api/monitor/usage/quota/limit`（`Authorization: <api_key>`） |
 | 激活额度 | `POST {base_url}/api/coding/paas/v4/chat/completions`（Bearer，发送 `"1"`） |
 | 重置卡余额 / 使用 | `GET/POST {base_url}/api/biz/customer-package-reset`（Bearer） |
+| 更新检查 | `GET https://api.github.com/repos/crazykun/GLMeter/releases/latest`（GitHub 公开 API，每 24h 一次） |
 
 - `TOKENS_LIMIT` → 5 小时窗口（Pro/Max 另有每周窗口），含 `percentage` 与 `nextResetTime`
 - `TIME_LIMIT` → MCP 月度额度

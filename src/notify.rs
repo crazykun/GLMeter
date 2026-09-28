@@ -1,6 +1,7 @@
 //! 重置卡提醒：
 //! - 到期提醒：剩余有效期跌破配置阈值（默认 24h/6h/1h）时各提醒一次
-//! - 新增提醒：可用张数比上次多时提醒
+//! - 新增/减少提醒：按 record_id 对比，减少时区分「使用」与「过期作废」
+//!   （依据 expireTime 是否已到 + lastXxxResetTime 是否变化）
 //!
 //! 渠道：系统桌面通知（各平台原生）+ 可选 webhook 机器人（企业微信/飞书/钉钉）。
 //! 提醒状态持久化在配置目录 `notify_state.json`，重启不重复提醒、不误报「新增」。
@@ -9,17 +10,36 @@ use crate::api::ResetCards;
 use crate::config::{Config, NotifyConfig};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-/// 去重/基线状态（配置目录 notify_state.json）
+/// 一张可用卡的跟踪信息（减少时用于归因）
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct TrackedCard {
+    /// 是否周额度卡
+    week: bool,
+    /// 服务端过期时间字符串（"2026-10-01 23:59:59"，同格式可直接字典序比较）
+    expire: String,
+}
+
+/// 去重/基线状态（配置目录 notify_state.json）。
+/// 旧版本状态文件缺少的字段按默认值补齐，多出的字段（如早期版本的 counts）被忽略
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct NotifyState {
-    /// 上次见到的可用张数（kind → count）；首次见到只记基线、不提醒
-    counts: HashMap<String, usize>,
+    /// 上次见到的可用卡：record_id → 跟踪信息
+    #[serde(default)]
+    cards: HashMap<i64, TrackedCard>,
+    /// 上次见到的「上次用卡时间」：kind("5h"/"week") → 服务端字符串（可能为 None）。
+    /// 键存在 = 该类型已完成基线；值变化 = 期间有用卡发生（服务端仅存最近一次）
+    #[serde(default)]
+    last_reset: HashMap<String, Option<String>>,
     /// 已提醒过的到期阈值：record_id → 已提醒阈值（小时）
+    #[serde(default)]
     expire_alerted: HashMap<i64, Vec<u64>>,
+    /// GLMeter 自己刚用掉的卡：等下次刷新确认其消失后消账，期间不计入减少提醒
+    #[serde(default)]
+    self_used: HashSet<i64>,
 }
 
 /// 状态文件名（与 config.toml 同目录）
@@ -44,6 +64,15 @@ fn save_state_to(path: &PathBuf, st: &NotifyState) -> Result<(), String> {
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
+/// 通用提醒：桌面通知 + 已配置的 webhook（更新检查等重置卡之外的场景复用，
+/// 渠道开关沿用 [notify] 配置）
+pub fn push(title: &str, body: &str, cfg: &Config) {
+    if cfg.notify.desktop {
+        send_desktop(title, body);
+    }
+    send_webhooks(cfg, title, body);
+}
+
 /// 每次拉取到重置卡余额后调用：对比持久化状态，产生并发送提醒。
 /// 阻塞时长 = 桌面通知 + webhook 发送（仅在有提醒时发生），调用方须已释放状态锁。
 pub fn check(resets: Option<&ResetCards>, cfg: &Config) {
@@ -55,7 +84,7 @@ pub fn check(resets: Option<&ResetCards>, cfg: &Config) {
     let mut st = load_state_from(&path);
     let mut lines = Vec::new();
     lines.extend(expire_lines(resets, &cfg.notify, &mut st));
-    lines.extend(growth_lines(resets, &mut st));
+    lines.extend(diff_lines(resets, &mut st));
 
     // 先落盘再发送：宁可漏发也不重复轰炸（发送失败不回滚，避免每轮重试刷屏）
     if let Err(e) = save_state_to(&path, &st) {
@@ -147,17 +176,110 @@ fn expire_lines(resets: &ResetCards, n: &NotifyConfig, st: &mut NotifyState) -> 
         .collect()
 }
 
-/// 新增提醒：可用张数比上次记录多时提醒；减少/持平只静默更新基线
-fn growth_lines(resets: &ResetCards, st: &mut NotifyState) -> Vec<String> {
+/// 新增/减少提醒（按 record_id 与上轮可用卡对比）：
+/// - 消失的卡：expireTime 未到 → 必是被使用（卡不会提前过期）；已过期的默认过期，
+///   但若该类型 lastXxxResetTime 变了且没有未过期的消失卡可解释，说明有 1 张
+///   是赶在过期前被用掉的
+/// - 新出现的 record_id → 新增
+/// - GLMeter 自己用掉的卡（self_used）消账不计提醒，其引发的 lastReset 变化
+///   也不作为其他卡「被使用」的归因信号
+/// - last_reset 无键 = 首次见到该类型 → 只记基线不提醒
+fn diff_lines(resets: &ResetCards, st: &mut NotifyState) -> Vec<String> {
+    let now = Local::now();
     let mut lines = Vec::new();
     for (week, label, key) in [(false, "5小时额度", "5h"), (true, "周额度", "week")] {
-        let n = resets.available_count(week);
-        let prev = st.counts.insert(key.to_string(), n);
-        if let Some(p) = prev.filter(|p| *p < n) {
-            lines.push(format!("🎁 {label}重置卡 +{}（现有 {n} 张可用）", n - p));
+        let now_cards: HashMap<i64, String> = resets
+            .list(week)
+            .iter()
+            .filter(|r| r.available)
+            .map(|r| (r.record_id, r.expire_time.clone()))
+            .collect();
+        let last = if week {
+            resets.last_week_reset.clone()
+        } else {
+            resets.last_five_hour_reset.clone()
+        };
+
+        // 基线：键不存在 = 首次见到，只记录
+        let baselined = st.last_reset.contains_key(key);
+        let prev_last = st.last_reset.insert(key.to_string(), last.clone());
+        let raw_changed = baselined && prev_last.flatten().as_deref() != last.as_deref();
+
+        // 自己用掉的卡确认消失 → 待消账（先参与消失排除，再从 self_used 移除）
+        let self_gone: Vec<i64> = st
+            .self_used
+            .iter()
+            .copied()
+            .filter(|id| {
+                st.cards.get(id).is_some_and(|c| c.week == week) && !now_cards.contains_key(id)
+            })
+            .collect();
+        // 自己用卡引发的变化不能拿来归因别的卡
+        let last_changed = raw_changed && self_gone.is_empty();
+
+        // 上轮可用、本轮不可用且非自己用掉的卡
+        let vanished: Vec<String> = st
+            .cards
+            .iter()
+            .filter(|(id, c)| {
+                c.week == week
+                    && !now_cards.contains_key(*id)
+                    && !st.self_used.contains(*id)
+                    && !self_gone.contains(id)
+            })
+            .map(|(_, c)| c.expire.clone())
+            .collect();
+        for id in &self_gone {
+            st.self_used.remove(id);
+        }
+        let added = now_cards
+            .keys()
+            .filter(|id| !st.cards.contains_key(*id))
+            .count();
+
+        if baselined {
+            let n = now_cards.len();
+            let future = vanished
+                .iter()
+                .filter(|e| parse_expire(e).is_some_and(|t| t > now))
+                .count();
+            let past = vanished.len() - future;
+            let (used, expired) = if last_changed && future == 0 && past > 0 {
+                (1, past - 1)
+            } else {
+                (future, past)
+            };
+            if used > 0 {
+                lines.push(format!(
+                    "♻️ {label}重置卡已使用 {used} 张（现有 {n} 张可用）"
+                ));
+            }
+            if expired > 0 {
+                lines.push(format!("⏰ {label}重置卡过期作废 {expired} 张"));
+            }
+            if added > 0 {
+                lines.push(format!("🎁 {label}重置卡 +{added}（现有 {n} 张可用）"));
+            }
+        }
+
+        // 更新该类型的跟踪集合：清掉本类型旧记录，写入仍可用的卡
+        st.cards.retain(|_, c| c.week != week);
+        for (id, expire) in now_cards {
+            st.cards.insert(id, TrackedCard { week, expire });
         }
     }
     lines
+}
+
+/// GLMeter 自己使用重置卡成功后调用：登记该卡，
+/// 下次刷新确认其消失时不再报「已使用」
+pub fn mark_self_used(record_id: i64) {
+    let path = state_path();
+    let mut st = load_state_from(&path);
+    st.self_used.insert(record_id);
+    if let Err(e) = save_state_to(&path, &st) {
+        eprintln!("[GLMeter] 通知状态保存失败: {e}");
+    }
 }
 
 /// 服务端过期时间字符串（"2026-10-01 23:59:59"，官网按北京时间展示）按本机时区解析；
@@ -398,6 +520,8 @@ mod tests {
                 })
                 .collect(),
             week: Vec::new(),
+            last_five_hour_reset: None,
+            last_week_reset: None,
         }
     }
 
@@ -465,31 +589,162 @@ mod tests {
     }
 
     #[test]
-    fn growth_alerts_only_on_increase() {
+    fn diff_baseline_first_fetch_is_silent() {
         let mut st = NotifyState::default();
-        // 首次见到 → 只记基线
-        assert!(growth_lines(&cards(&[(1, "", true)]), &mut st).is_empty());
-        // 1 → 3 → 提醒 +2
-        let lines = growth_lines(
-            &cards(&[(1, "", true), (2, "", true), (3, "", true)]),
+        assert!(diff_lines(&cards(&[(1, &expire_at(10.0), true)]), &mut st).is_empty());
+        // 已记录基线：卡片集合 + last_reset 键
+        assert_eq!(st.cards.len(), 1);
+        assert!(st.last_reset.contains_key("5h"));
+        assert!(st.last_reset.contains_key("week"));
+    }
+
+    #[test]
+    fn diff_new_card_reported_by_id() {
+        let mut st = NotifyState::default();
+        diff_lines(&cards(&[(1, &expire_at(10.0), true)]), &mut st);
+        let lines = diff_lines(
+            &cards(&[(1, &expire_at(10.0), true), (2, &expire_at(20.0), true)]),
             &mut st,
         );
-        assert_eq!(lines, vec!["🎁 5小时额度重置卡 +2（现有 3 张可用）"]);
-        // 减少 → 静默
-        assert!(growth_lines(&cards(&[(1, "", true)]), &mut st).is_empty());
-        // 回升 → 再提醒
-        let lines = growth_lines(&cards(&[(1, "", true), (4, "", true)]), &mut st);
         assert_eq!(lines, vec!["🎁 5小时额度重置卡 +1（现有 2 张可用）"]);
+        // 同一轮再查 → 静默
+        assert!(diff_lines(
+            &cards(&[(1, &expire_at(10.0), true), (2, &expire_at(20.0), true)]),
+            &mut st
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn diff_vanished_with_future_expiry_is_used() {
+        let mut st = NotifyState::default();
+        diff_lines(
+            &cards(&[(1, &expire_at(10.0), true), (2, &expire_at(20.0), true)]),
+            &mut st,
+        );
+        // 未过期的卡消失（lastReset 未变，如两次刷新间被用掉）→ 已使用
+        let lines = diff_lines(&cards(&[(2, &expire_at(20.0), true)]), &mut st);
+        assert_eq!(
+            lines,
+            vec!["♻️ 5小时额度重置卡已使用 1 张（现有 1 张可用）"]
+        );
+    }
+
+    #[test]
+    fn diff_expired_without_last_reset_change() {
+        let mut st = NotifyState::default();
+        diff_lines(
+            &cards(&[(1, &expire_at(-0.1), true), (2, &expire_at(20.0), true)]),
+            &mut st,
+        );
+        // 已过期时间点的卡消失，lastReset 未变 → 过期作废
+        let lines = diff_lines(&cards(&[(2, &expire_at(20.0), true)]), &mut st);
+        assert_eq!(lines, vec!["⏰ 5小时额度重置卡过期作废 1 张"]);
+    }
+
+    #[test]
+    fn diff_last_reset_change_implies_use_of_expired_card() {
+        let mut st = NotifyState::default();
+        diff_lines(
+            &cards(&[(1, &expire_at(-0.1), true), (2, &expire_at(-0.2), true)]),
+            &mut st,
+        );
+        // 两张都已过 expireTime，但 lastReset 变了 → 1 张是赶在过期前用掉的，
+        // 剩下 1 张过期作废
+        let mut r = cards(&[]);
+        r.last_five_hour_reset = Some("2026-09-28 10:00:00".into());
+        let lines = diff_lines(&r, &mut st);
+        assert_eq!(
+            lines,
+            vec![
+                "♻️ 5小时额度重置卡已使用 1 张（现有 0 张可用）",
+                "⏰ 5小时额度重置卡过期作废 1 张",
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_self_used_suppressed_and_neutralizes_last_reset() {
+        let mut st = NotifyState::default();
+        diff_lines(
+            &cards(&[(1, &expire_at(-0.1), true), (2, &expire_at(20.0), true)]),
+            &mut st,
+        );
+        // 自己用掉了卡 2（未过期），随后它消失且 lastReset 变化 → 不提醒，
+        // lastReset 变化也不归因到同时消失的卡 1（过期）头上
+        st.self_used.insert(2);
+        let mut r = cards(&[(1, &expire_at(-0.1), true)]);
+        r.last_five_hour_reset = Some("2026-09-28 10:00:00".into());
+        let lines = diff_lines(&r, &mut st);
+        assert!(lines.is_empty(), "{lines:?}");
+        // 消账完成
+        assert!(st.self_used.is_empty());
+        // 下轮新增恢复正常
+        let lines = diff_lines(
+            &cards(&[(1, &expire_at(-0.1), true), (3, &expire_at(30.0), true)]),
+            &mut st,
+        );
+        assert_eq!(lines, vec!["🎁 5小时额度重置卡 +1（现有 2 张可用）"]);
+    }
+
+    #[test]
+    fn diff_swap_reports_used_and_added() {
+        let mut st = NotifyState::default();
+        diff_lines(&cards(&[(1, &expire_at(10.0), true)]), &mut st);
+        // 同轮：卡 1 被用掉 + 新卡 2 到账（总数不变，但都应报出来）
+        let lines = diff_lines(&cards(&[(2, &expire_at(20.0), true)]), &mut st);
+        assert_eq!(
+            lines,
+            vec![
+                "♻️ 5小时额度重置卡已使用 1 张（现有 1 张可用）",
+                "🎁 5小时额度重置卡 +1（现有 1 张可用）",
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_week_kind_tracked_separately() {
+        let mut st = NotifyState::default();
+        let mut r = cards(&[]);
+        r.week = vec![ResetRecord {
+            record_id: 21,
+            expire_time: expire_at(-0.1), // 已到过期时间
+            available: true,
+        }];
+        assert!(diff_lines(&r, &mut st).is_empty());
+        r.week[0].available = false;
+        let lines = diff_lines(&r, &mut st);
+        assert_eq!(lines, vec!["⏰ 周额度重置卡过期作废 1 张"]);
     }
 
     #[test]
     fn state_serializes_losslessly() {
         let mut st = NotifyState::default();
-        st.counts.insert("5h".into(), 3);
+        st.cards.insert(
+            7,
+            TrackedCard {
+                week: false,
+                expire: "2026-10-01 23:59:59".into(),
+            },
+        );
+        st.last_reset
+            .insert("5h".into(), Some("2026-09-26 20:39:51".into()));
+        st.last_reset.insert("week".into(), None);
         st.expire_alerted.insert(42, vec![24, 6]);
+        st.self_used.insert(99);
         let json = serde_json::to_string(&st).unwrap();
         let back: NotifyState = serde_json::from_str(&json).unwrap();
         assert_eq!(st, back);
+    }
+
+    /// 旧版本状态文件（含已废弃的 counts 字段、缺新字段）应能正常读取
+    #[test]
+    fn state_loads_legacy_file() {
+        let legacy = r#"{"counts":{"5h":3},"expire_alerted":{"42":[24]}}"#;
+        let st: NotifyState = serde_json::from_str(legacy).unwrap();
+        assert!(st.cards.is_empty());
+        assert!(st.self_used.is_empty());
+        assert_eq!(st.expire_alerted.get(&42), Some(&vec![24]));
     }
 
     #[test]

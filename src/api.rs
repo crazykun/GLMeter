@@ -46,6 +46,9 @@ pub struct ResetRecord {
 pub struct ResetCards {
     pub five_hour: Vec<ResetRecord>,
     pub week: Vec<ResetRecord>,
+    /// 上次使用 5h / 周重置卡的时间（仅用卡时更新，自然重置不影响）
+    pub last_five_hour_reset: Option<String>,
+    pub last_week_reset: Option<String>,
 }
 
 impl ResetCards {
@@ -317,6 +320,14 @@ fn parse_reset_cards(body: &str) -> Result<ResetCards, String> {
     Ok(ResetCards {
         five_hour: records("fiveHourResets"),
         week: records("weekResets"),
+        last_five_hour_reset: data
+            .get("lastFiveHourResetTime")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        last_week_reset: data
+            .get("lastWeekResetTime")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     })
 }
 
@@ -353,6 +364,52 @@ pub fn use_reset_card(
         return Err(format!("HTTP {status}: {msg}"));
     }
     parse_biz_response(&body).map(|_| ())
+}
+
+/// GitHub 最新 Release（更新检查用）
+#[derive(Debug, Clone)]
+pub struct LatestRelease {
+    /// tag 名，如 "v0.2.9"
+    pub tag: String,
+    /// Release 页面地址（为空时调用方应使用固定常量）
+    pub url: String,
+}
+
+/// 更新检查走 GitHub 公开 API（无鉴权，限频 60 次/时，一天一查 + 手动足够）
+pub const GITHUB_API_LATEST: &str = "https://api.github.com/repos/crazykun/GLMeter/releases/latest";
+
+pub fn fetch_latest_release(client: &reqwest::blocking::Client) -> Result<LatestRelease, String> {
+    let resp = client
+        .get(GITHUB_API_LATEST)
+        .header("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .map_err(|e| format!("网络错误: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
+    if !status.is_success() {
+        // GitHub 限频时返回 403，body 里带 message
+        let msg = extract_msg(&body).unwrap_or_else(|| status.to_string());
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+    parse_release_latest(&body)
+}
+
+/// latest 响应 → LatestRelease（纯函数，便于单测）
+fn parse_release_latest(body: &str) -> Result<LatestRelease, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("解析失败: {e}"))?;
+    let tag = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .ok_or("响应缺少 tag_name")?;
+    Ok(LatestRelease {
+        tag: tag.to_string(),
+        url: v
+            .get("html_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 static REQUEST_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -487,19 +544,47 @@ mod tests {
             ],
             "weekResets": [
                 { "recordId": 21, "expireTime": "2026-10-01 23:59:59", "available": true }
-            ] } }"#;
+            ],
+            "lastFiveHourResetTime": "2026-09-26 20:39:51",
+            "lastWeekResetTime": null } }"#;
         let r = parse_reset_cards(body).unwrap();
         assert_eq!(r.available_count(false), 2);
         assert_eq!(r.available_count(true), 1);
         // 优先消耗最早过期的可用卡（过期卡不可用）
         assert_eq!(r.pick(false).unwrap().record_id, 13);
         assert_eq!(r.pick(true).unwrap().record_id, 21);
+        // 上次用卡时间：字符串透传，null → None
+        assert_eq!(
+            r.last_five_hour_reset.as_deref(),
+            Some("2026-09-26 20:39:51")
+        );
+        assert_eq!(r.last_week_reset, None);
+        // 字段缺失 → None
+        let bare = parse_reset_cards(
+            r#"{ "code": 200, "success": true, "data": { "fiveHourResets": [] } }"#,
+        )
+        .unwrap();
+        assert_eq!(bare.last_five_hour_reset, None);
         // 业务错误按 Err 处理
         let err = parse_reset_cards(
             r#"{ "code": 400, "msg": "不支持的重置对象类型: X", "success": false }"#,
         )
         .unwrap_err();
         assert!(err.contains("不支持"));
+    }
+
+    #[test]
+    fn release_latest_parsed() {
+        let body = r#"{
+            "tag_name": "v0.2.9",
+            "html_url": "https://github.com/crazykun/GLMeter/releases/tag/v0.2.9"
+        }"#;
+        let r = parse_release_latest(body).unwrap();
+        assert_eq!(r.tag, "v0.2.9");
+        assert!(r.url.contains("releases/tag/v0.2.9"));
+        // 缺 tag_name（如 404/限频 body 解析成对象）→ Err
+        assert!(parse_release_latest(r#"{"message":"Not Found"}"#).is_err());
+        assert!(parse_release_latest("<html>502</html>").is_err());
     }
 
     #[test]

@@ -6,8 +6,8 @@
 //! - 菜单按需拉取（DBusMenu），数据刷新不会导致重复注册
 
 use super::{
-    UiState, ID_ACTIVATE, ID_CONFIG, ID_REFRESH, ID_REPO, ID_RESET_SITE, ID_USE_RESET_5H,
-    ID_USE_RESET_WEEK,
+    UiState, ID_ABOUT, ID_ACTIVATE, ID_CHECK_UPDATE, ID_CONFIG, ID_REFRESH, ID_RESET_SITE,
+    ID_USE_RESET_5H, ID_USE_RESET_WEEK, ID_VIEW_UPDATE,
 };
 use crate::ui;
 use crate::{spawn_ticker, spawn_worker, Cmd};
@@ -32,13 +32,17 @@ impl Tray for GlmTray {
         ui::title_text(&self.state.lock().unwrap())
     }
 
-    /// SNI ToolTip 属性：悬停时优先展示的富提示（多行详情）
+    /// SNI ToolTip 属性：悬停时优先展示的富提示（多行详情）。
+    /// 标题与明细合并进 title 单字段：Deepin（dde-tray-loader/dde-dock）只读
+    /// title、完全忽略 description，分开放会导致悬停只剩一行标题；
+    /// KDE Plasma 两个字段都渲染 → description 留空避免内容重复
     fn tool_tip(&self) -> ToolTip {
         let state = self.state.lock().unwrap();
         let (title, lines) = ui::tooltip(&state);
+        let mut all = vec![title];
+        all.extend(lines);
         ToolTip {
-            title,
-            description: lines.join("\n"),
+            title: all.join("\n"),
             ..Default::default()
         }
     }
@@ -72,10 +76,12 @@ impl Tray for GlmTray {
                                 ID_ACTIVATE => Cmd::Activate { scheduled: false },
                                 ID_REFRESH => Cmd::Fetch,
                                 ID_CONFIG => Cmd::OpenConfig,
-                                ID_REPO => Cmd::OpenRepo,
+                                ID_ABOUT => Cmd::About,
                                 ID_USE_RESET_5H => Cmd::UseResetCard { week: false },
                                 ID_USE_RESET_WEEK => Cmd::UseResetCard { week: true },
                                 ID_RESET_SITE => Cmd::OpenResetSite,
+                                ID_CHECK_UPDATE => Cmd::CheckUpdate { manual: true },
+                                ID_VIEW_UPDATE => Cmd::OpenReleases,
                                 _ => Cmd::Quit,
                             };
                             let _ = cmd_tx.send(cmd);

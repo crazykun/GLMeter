@@ -97,10 +97,12 @@ pub fn run(state: Arc<Mutex<UiState>>) {
                         ui::ID_ACTIVATE => Cmd::Activate { scheduled: false },
                         ui::ID_REFRESH => Cmd::Fetch,
                         ui::ID_CONFIG => Cmd::OpenConfig,
-                        ui::ID_REPO => Cmd::OpenRepo,
+                        ui::ID_ABOUT => Cmd::About,
                         ui::ID_USE_RESET_5H => Cmd::UseResetCard { week: false },
                         ui::ID_USE_RESET_WEEK => Cmd::UseResetCard { week: true },
                         ui::ID_RESET_SITE => Cmd::OpenResetSite,
+                        ui::ID_CHECK_UPDATE => Cmd::CheckUpdate { manual: true },
+                        ui::ID_VIEW_UPDATE => Cmd::OpenReleases,
                         ui::ID_QUIT => {
                             *control_flow = ControlFlow::Exit;
                             return;

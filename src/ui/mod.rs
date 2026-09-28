@@ -17,19 +17,25 @@ pub mod trayicon;
 
 pub const ID_ACTIVATE: &str = "activate";
 pub const ID_REFRESH: &str = "refresh";
+pub const ID_CHECK_UPDATE: &str = "check_update";
+pub const ID_VIEW_UPDATE: &str = "view_update";
 pub const ID_CONFIG: &str = "config";
-pub const ID_REPO: &str = "repo";
+pub const ID_ABOUT: &str = "about";
 pub const ID_QUIT: &str = "quit";
 pub const ID_USE_RESET_5H: &str = "use_reset_5h";
 pub const ID_USE_RESET_WEEK: &str = "use_reset_week";
 pub const ID_RESET_SITE: &str = "reset_site";
 
-/// 官网重置卡管理页（无卡/接口失败时的兜底入口）
-pub const RESET_SITE_URL: &str = "https://www.bigmodel.cn/coding-plan/personal/usage";
+/// 官网用量统计页（重置卡管理兜底入口 + 关于窗口）
+pub const USAGE_SITE_URL: &str = "https://www.bigmodel.cn/coding-plan/personal/usage";
+/// 邀请注册 GLM Coding Plan（关于窗口入口）
+pub const INVITE_URL: &str =
+    "https://www.bigmodel.cn/invite?icode=f29CfZ4kBFQdMSoleW%2FTKmczbXFgPRGIalpycrEwJ28%3D";
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const REPO: &str = "github.com/crazykun/GLMeter";
 pub const REPO_URL: &str = "https://github.com/crazykun/GLMeter";
+/// Release 页（更新检查跳转目标，始终指向最新版）
+pub const RELEASES_URL: &str = "https://github.com/crazykun/GLMeter/releases/latest";
 
 pub enum Status {
     Loading,
@@ -38,11 +44,28 @@ pub enum Status {
     Err(String),
 }
 
+/// 一次更新检查的结果
+pub enum UpdateStatus {
+    /// 当前版本已是最新
+    Latest,
+    /// 有新版本（latest 为去 v 前缀的版本号，url 为对应 Release 页）
+    Newer { latest: String, url: String },
+    /// 检查失败（网络/限频等）
+    Failed(String),
+}
+
+pub struct UpdateInfo {
+    pub checked_at: DateTime<Local>,
+    pub status: UpdateStatus,
+}
+
 pub struct UiState {
     pub cfg: Config,
     pub cfg_path: PathBuf,
     pub status: Status,
     pub busy: Option<String>,
+    /// 最近一次更新检查的结果（None = 尚未检查过）
+    pub update: Option<UpdateInfo>,
 }
 
 impl UiState {
@@ -57,6 +80,7 @@ impl UiState {
             cfg_path,
             status,
             busy: None,
+            update: None,
         }
     }
 }
@@ -176,10 +200,36 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
         id: ID_CONFIG,
         text: "⚙ 打开配置文件".into(),
     });
+    // 更新 / 关于 / 退出：独立分组
+    v.push(MenuEntry::Separator);
+    // 发现新版本时的独立入口（否则不占行）
+    if let Some(UpdateInfo {
+        status: UpdateStatus::Newer { latest, .. },
+        ..
+    }) = &state.update
+    {
+        v.push(MenuEntry::Button {
+            id: ID_VIEW_UPDATE,
+            text: format!("🆕 新版本 v{latest} 可用 · 查看更新"),
+        });
+    }
+    // 检查结果直接挂在按钮上（与「立即刷新（更新于…）」同一模式：动作与反馈同行）
+    let update_text = match state.update.as_ref().map(|i| &i.status) {
+        Some(UpdateStatus::Latest) => format!("🆕 检查更新（✓ 已是最新 v{VERSION}）"),
+        Some(UpdateStatus::Failed(e)) => format!(
+            "🆕 检查更新（⚠ {}）",
+            e.chars().take(16).collect::<String>()
+        ),
+        _ => "🆕 检查更新".to_string(),
+    };
     v.push(MenuEntry::Button {
-        id: ID_REPO,
-        // 点击整行 → 默认浏览器打开仓库页
-        text: format!("↗ GLMeter v{VERSION} · {REPO}"),
+        id: ID_CHECK_UPDATE,
+        text: update_text,
+    });
+    v.push(MenuEntry::Button {
+        id: ID_ABOUT,
+        // 点击 → 弹出关于窗口（版本 + 官网用量 / 邀请注册 / GitHub 入口）
+        text: format!("ℹ 关于 GLMeter v{VERSION}"),
     });
     v.push(MenuEntry::Button {
         id: ID_QUIT,
