@@ -566,7 +566,9 @@ B 'GLM 注册' $Invite 244
 B '确定' '' 356
 [void]$f.ShowDialog()"#;
     let icon = about_icon_path();
-    if std::fs::write(&script, ps).is_ok() {
+    // powershell.exe(5.1) 对无 BOM 的脚本按系统 ANSI(中文系统=GBK)解码会乱码，写 BOM 强制按 UTF-8 读
+    let ps = format!("\u{FEFF}{ps}");
+    if std::fs::write(&script, ps.as_bytes()).is_ok() {
         let ok = std::process::Command::new("powershell")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&script)
