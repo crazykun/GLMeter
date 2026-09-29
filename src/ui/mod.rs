@@ -213,12 +213,12 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
         status => v.push(MenuEntry::Button {
             id: ID_CHECK_UPDATE,
             text: match status {
-                Some(UpdateStatus::Latest) => format!("检查更新（✓ 已是最新 v{VERSION}）"),
+                Some(UpdateStatus::Latest) => format!("🔍 检查更新（✓ 已是最新 v{VERSION}）"),
                 Some(UpdateStatus::Failed(e)) => format!(
-                    "检查更新（⚠ {}）",
+                    "🔍 检查更新（⚠ {}）",
                     e.chars().take(16).collect::<String>()
                 ),
-                _ => "检查更新".to_string(),
+                _ => "🔍 检查更新".to_string(),
             },
         }),
     }
