@@ -202,30 +202,26 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
     });
     // 更新 / 关于 / 退出：独立分组
     v.push(MenuEntry::Separator);
-    // 发现新版本时的独立入口（否则不占行）
-    if let Some(UpdateInfo {
-        status: UpdateStatus::Newer { latest, .. },
-        ..
-    }) = &state.update
-    {
-        v.push(MenuEntry::Button {
+    // 更新入口合一行：发现新版本 → 该行变为直达 Release 页的入口（手动检查
+    // 不再单独占行：Release 页永远显示最新版，自动检查也照常跑）；否则为
+    // 手动检查入口，检查结果像「立即刷新（更新于…）」一样挂在按钮上
+    match state.update.as_ref().map(|i| &i.status) {
+        Some(UpdateStatus::Newer { latest, .. }) => v.push(MenuEntry::Button {
             id: ID_VIEW_UPDATE,
-            text: format!("🆕 新版本 v{latest} 可用 · 查看更新"),
-        });
+            text: format!("🆕 新版本 v{latest} 可用 · 点击前往更新"),
+        }),
+        status => v.push(MenuEntry::Button {
+            id: ID_CHECK_UPDATE,
+            text: match status {
+                Some(UpdateStatus::Latest) => format!("检查更新（✓ 已是最新 v{VERSION}）"),
+                Some(UpdateStatus::Failed(e)) => format!(
+                    "检查更新（⚠ {}）",
+                    e.chars().take(16).collect::<String>()
+                ),
+                _ => "检查更新".to_string(),
+            },
+        }),
     }
-    // 检查结果直接挂在按钮上（与「立即刷新（更新于…）」同一模式：动作与反馈同行）
-    let update_text = match state.update.as_ref().map(|i| &i.status) {
-        Some(UpdateStatus::Latest) => format!("🆕 检查更新（✓ 已是最新 v{VERSION}）"),
-        Some(UpdateStatus::Failed(e)) => format!(
-            "🆕 检查更新（⚠ {}）",
-            e.chars().take(16).collect::<String>()
-        ),
-        _ => "🆕 检查更新".to_string(),
-    };
-    v.push(MenuEntry::Button {
-        id: ID_CHECK_UPDATE,
-        text: update_text,
-    });
     v.push(MenuEntry::Button {
         id: ID_ABOUT,
         // 点击 → 弹出关于窗口（版本 + 官网用量 / 邀请注册 / GitHub 入口）
