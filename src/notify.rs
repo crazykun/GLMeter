@@ -1,4 +1,6 @@
-//! 重置卡提醒：
+//! 额度与重置卡提醒：
+//! - 额度耗尽提醒：5 小时 / 每周 Token 窗口 + MCP 月额度的剩余跌破配置阈值
+//!   （默认 20% / 10% / 5% / 1%）时各提醒一次，额度重置后重新武装
 //! - 到期提醒：剩余有效期跌破配置阈值（默认 24h/6h/1h）时各提醒一次
 //! - 新增/减少提醒：按 record_id 对比，减少时区分「使用」与「过期作废」
 //!   （依据 expireTime 是否已到 + lastXxxResetTime 是否变化）
@@ -6,7 +8,7 @@
 //! 渠道：系统桌面通知（各平台原生）+ 可选 webhook 机器人（企业微信/飞书/钉钉）。
 //! 提醒状态持久化在配置目录 `notify_state.json`，重启不重复提醒、不误报「新增」。
 
-use crate::api::ResetCards;
+use crate::api::{QuotaSnapshot, ResetCards};
 use crate::config::{Config, NotifyConfig};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,10 @@ struct NotifyState {
     /// 已提醒过的到期阈值：record_id → 已提醒阈值（小时）
     #[serde(default)]
     expire_alerted: HashMap<i64, Vec<u64>>,
+    /// 已提醒过的低额度阈值：额度类型（窗口 label / "MCP 月额度"）→
+    /// 已提醒阈值（剩余百分比）。额度重置（剩余高于全部阈值）时清空
+    #[serde(default)]
+    quota_alerted: HashMap<String, Vec<f64>>,
     /// GLMeter 自己刚用掉的卡：等下次刷新确认其消失后消账，期间不计入减少提醒
     #[serde(default)]
     self_used: HashSet<i64>,
@@ -73,18 +79,23 @@ pub fn push(title: &str, body: &str, cfg: &Config) {
     send_webhooks(cfg, title, body);
 }
 
-/// 每次拉取到重置卡余额后调用：对比持久化状态，产生并发送提醒。
+/// 每次拉取到额度快照后调用：对比持久化状态，产生并发送提醒。
 /// 阻塞时长 = 桌面通知 + webhook 发送（仅在有提醒时发生），调用方须已释放状态锁。
-pub fn check(resets: Option<&ResetCards>, cfg: &Config) {
-    let Some(resets) = resets else { return };
+pub fn check(snapshot: Option<&QuotaSnapshot>, cfg: &Config) {
+    let Some(snapshot) = snapshot else { return };
     if !cfg.notify.any_enabled() {
         return;
     }
     let path = state_path();
     let mut st = load_state_from(&path);
     let mut lines = Vec::new();
-    lines.extend(expire_lines(resets, &cfg.notify, &mut st));
-    lines.extend(diff_lines(resets, &mut st));
+    lines.extend(quota_lines(snapshot, &cfg.notify, &mut st));
+    // 重置卡接口失败（resets = None）时跳过重置卡部分，本轮不更新其基线，
+    // 下轮成功后整体对比，避免误报「消失」；额度提醒不受影响
+    if let Some(resets) = &snapshot.resets {
+        lines.extend(expire_lines(resets, &cfg.notify, &mut st));
+        lines.extend(diff_lines(resets, &mut st));
+    }
 
     // 先落盘再发送：宁可漏发也不重复轰炸（发送失败不回滚，避免每轮重试刷屏）
     if let Err(e) = save_state_to(&path, &st) {
@@ -94,12 +105,96 @@ pub fn check(resets: Option<&ResetCards>, cfg: &Config) {
     if lines.is_empty() {
         return;
     }
-    let title = "GLMeter · 重置卡提醒";
+    let title = "GLMeter · 提醒";
     let body = lines.join("\n");
     if cfg.notify.desktop {
         send_desktop(title, &body);
     }
     send_webhooks(cfg, title, &body);
+}
+
+/// 额度耗尽提醒：5 小时 / 每周 Token 窗口与 MCP 月额度的剩余跌破配置阈值
+/// （remain_pct，剩余百分比）时各提醒一次，每类每档只提醒一次；同一轮跨过
+/// 多个档位只按最紧急的一档提醒，其余档位一并标记已提醒。额度重置（剩余
+/// 高于全部阈值）后清空该类记录，下次耗尽重新提醒。
+fn quota_lines(snap: &QuotaSnapshot, n: &NotifyConfig, st: &mut NotifyState) -> Vec<String> {
+    // 过滤非法阈值（负数 / 超过 100），降序排好后首位即最大阈值；
+    // 0 为合法档 = 仅在额度用光时提醒
+    let mut thresholds: Vec<f64> = n
+        .remain_pct
+        .iter()
+        .copied()
+        .filter(|t| *t >= 0.0 && *t <= 100.0)
+        .collect();
+    thresholds.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    thresholds.dedup();
+    if thresholds.is_empty() {
+        return Vec::new();
+    }
+    let max_threshold = thresholds[0];
+
+    // (类型, 剩余百分比, 剩余量文案)；去重键用窗口 label（parse_quota 硬编码，稳定）
+    let mut items: Vec<(&str, f64, String)> = snap
+        .windows
+        .iter()
+        .map(|w| {
+            (
+                w.label.as_str(),
+                (100.0 - w.used_pct).clamp(0.0, 100.0),
+                format!("{}%", fmt_pct((100.0 - w.used_pct).clamp(0.0, 100.0))),
+            )
+        })
+        .collect();
+    if let Some(m) = &snap.mcp {
+        let remaining_pct = (100.0 - m.used_pct).clamp(0.0, 100.0);
+        let remain_text = if m.total > 0 {
+            format!("{}/{} 次", (m.total - m.used).max(0), m.total)
+        } else {
+            format!("{}%", fmt_pct(remaining_pct))
+        };
+        items.push(("MCP 月额度", remaining_pct, remain_text));
+    }
+
+    let mut lines = Vec::new();
+    for (key, remaining, remain_text) in items {
+        if remaining > max_threshold {
+            // 已重置/回升到所有阈值之上 → 重新武装
+            st.quota_alerted.remove(key);
+            continue;
+        }
+        let alerted = st.quota_alerted.entry(key.to_string()).or_default();
+        let newly: Vec<f64> = thresholds
+            .iter()
+            .copied()
+            .filter(|t| remaining <= *t && !alerted.contains(t))
+            .collect();
+        if newly.is_empty() {
+            continue;
+        }
+        alerted.extend(newly.iter().copied());
+        let urgent = newly.iter().copied().fold(f64::INFINITY, f64::min);
+        let why = if urgent == 0.0 {
+            "已用完".to_string()
+        } else {
+            format!("低于 {}%", fmt_pct(urgent))
+        };
+        lines.push(format!("⚠ {key}剩余 {remain_text}（{why}）"));
+    }
+    // 阈值配置缩水（如删掉某档）时同步收缩已提醒记录，防止无限增长
+    for alerted in st.quota_alerted.values_mut() {
+        alerted.retain(|t| thresholds.contains(t));
+    }
+    st.quota_alerted.retain(|_, a| !a.is_empty());
+    lines
+}
+
+/// 百分比显示：整数或 ≥10 取整（"20"），小数且 <10 保留 1 位（"0.8"）
+fn fmt_pct(v: f64) -> String {
+    if v >= 10.0 || v == v.trunc() {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
 }
 
 /// 到期提醒：找出本轮新跌破阈值的卡，按「类型+最紧急档位」分组，每组一行。
@@ -232,10 +327,19 @@ fn diff_lines(resets: &ResetCards, st: &mut NotifyState) -> Vec<String> {
         for id in &self_gone {
             st.self_used.remove(id);
         }
-        let added = now_cards
+        let added_ids: Vec<i64> = now_cards
             .keys()
             .filter(|id| !st.cards.contains_key(*id))
-            .count();
+            .copied()
+            .collect();
+        let added = added_ids.len();
+        // 新到卡中最早过期的一张（同格式字典序即时间序）
+        let added_expire = added_ids
+            .iter()
+            .filter_map(|id| now_cards.get(id))
+            .min()
+            .map(|e| crate::ui::fmt_expire(e).to_string())
+            .filter(|e| !e.is_empty());
 
         if baselined {
             let n = now_cards.len();
@@ -251,14 +355,19 @@ fn diff_lines(resets: &ResetCards, st: &mut NotifyState) -> Vec<String> {
             };
             if used > 0 {
                 lines.push(format!(
-                    "♻️ {label}重置卡已使用 {used} 张（现有 {n} 张可用）"
+                    "♻️ {label}重置卡已使用 {used} 张，额度已重置（剩 {n} 张可用）"
                 ));
             }
             if expired > 0 {
                 lines.push(format!("⏰ {label}重置卡过期作废 {expired} 张"));
             }
             if added > 0 {
-                lines.push(format!("🎁 {label}重置卡 +{added}（现有 {n} 张可用）"));
+                let exp = added_expire
+                    .map(|e| format!("，最早 {e} 过期"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "🎁 新到 {added} 张 {label}重置卡{exp}（现有 {n} 张可用）"
+                ));
             }
         }
 
@@ -506,7 +615,7 @@ fn dingtalk_sign(secret: &str, ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ResetRecord;
+    use crate::api::{McpLimit, QuotaSnapshot, ResetRecord, TokenWindow};
     use chrono::Duration;
 
     fn cards(entries: &[(i64, &str, bool)]) -> ResetCards {
@@ -536,6 +645,41 @@ mod tests {
             expire_hours: hours.to_vec(),
             desktop: false,
             ..NotifyConfig::default()
+        }
+    }
+
+    fn quota_cfg(pcts: &[f64]) -> NotifyConfig {
+        NotifyConfig {
+            remain_pct: pcts.to_vec(),
+            desktop: false,
+            ..NotifyConfig::default()
+        }
+    }
+
+    /// 构造额度快照：windows 按索引贴标签（与 parse_quota 一致），mcp 传 (used, total, used_pct)
+    fn quota_snap(used_pcts: &[f64], mcp: Option<(i64, i64, f64)>) -> QuotaSnapshot {
+        let labels = ["5小时额度", "每周额度"];
+        QuotaSnapshot {
+            level: "lite".into(),
+            windows: used_pcts
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| TokenWindow {
+                    label: labels.get(i).copied().unwrap_or(labels[0]).to_string(),
+                    used_pct: p,
+                    activated: true,
+                    next_reset: None,
+                })
+                .collect(),
+            mcp: mcp.map(|(used, total, pct)| McpLimit {
+                used,
+                total,
+                used_pct: pct,
+                next_reset: None,
+                details: Vec::new(),
+            }),
+            fetched_at: Local::now(),
+            resets: None,
         }
     }
 
@@ -589,6 +733,102 @@ mod tests {
     }
 
     #[test]
+    fn quota_alerts_fire_once_per_level() {
+        let n = quota_cfg(&[20.0, 10.0, 5.0, 1.0]);
+        let mut st = NotifyState::default();
+
+        // 剩余 18% → 跌破 20% 档
+        let lines = quota_lines(&quota_snap(&[82.0], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 18%（低于 20%）"]);
+        // 同一状态再查 → 不重复提醒
+        assert!(quota_lines(&quota_snap(&[82.0], None), &n, &mut st).is_empty());
+
+        // 一轮内跌到剩 4% → 跨过 10% 与 5% 两档，只按最紧急的一档提醒
+        let lines = quota_lines(&quota_snap(&[96.0], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 4%（低于 5%）"]);
+
+        // 跌破 1% 档（剩余 <10 显示 1 位小数）
+        let lines = quota_lines(&quota_snap(&[99.5], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 0.5%（低于 1%）"]);
+    }
+
+    #[test]
+    fn quota_rearms_after_reset() {
+        let n = quota_cfg(&[20.0]);
+        let mut st = NotifyState::default();
+
+        let lines = quota_lines(&quota_snap(&[85.0], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 15%（低于 20%）"]);
+
+        // 窗口重置（已用 0，含未激活窗口）→ 剩余回到阈值之上，静默并清空记录
+        assert!(quota_lines(&quota_snap(&[0.0], None), &n, &mut st).is_empty());
+        assert!(!st.quota_alerted.contains_key("5小时额度"));
+
+        // 再次跌破 → 重新提醒
+        let lines = quota_lines(&quota_snap(&[90.0], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 10%（低于 20%）"]);
+    }
+
+    #[test]
+    fn quota_kinds_tracked_separately() {
+        let n = quota_cfg(&[10.0]);
+        let mut st = NotifyState::default();
+
+        // 5h 剩 95%、周剩 5%、MCP 剩 8% → 后两类提醒，5h 不动；MCP 按剩余次数显示
+        let lines = quota_lines(
+            &quota_snap(&[5.0, 95.0], Some((92, 100, 92.0))),
+            &n,
+            &mut st,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "⚠ 每周额度剩余 5%（低于 10%）",
+                "⚠ MCP 月额度剩余 8/100 次（低于 10%）",
+            ]
+        );
+        // 各类只提醒一次
+        assert!(quota_lines(
+            &quota_snap(&[5.0, 95.0], Some((92, 100, 92.0))),
+            &n,
+            &mut st
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn quota_zero_threshold_alerts_when_exhausted() {
+        let n = quota_cfg(&[0.0]);
+        let mut st = NotifyState::default();
+        // 仅剩 3% → 未触达 0 档
+        assert!(quota_lines(&quota_snap(&[97.0], None), &n, &mut st).is_empty());
+        // 用光 → 提醒
+        let lines = quota_lines(&quota_snap(&[100.0], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 0%（已用完）"]);
+    }
+
+    #[test]
+    fn quota_invalid_thresholds_ignored() {
+        let mut st = NotifyState::default();
+        // 全部非法（负数 / 超 100）→ 相当于关闭
+        let n = quota_cfg(&[-5.0, 150.0]);
+        assert!(quota_lines(&quota_snap(&[99.0], None), &n, &mut st).is_empty());
+        // 合法与非法混合 → 只保留合法档
+        let n = quota_cfg(&[20.0, 150.0]);
+        let lines = quota_lines(&quota_snap(&[85.0], None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 15%（低于 20%）"]);
+    }
+
+    #[test]
+    fn quota_mcp_total_unknown_falls_back_to_pct() {
+        let n = quota_cfg(&[5.0]);
+        let mut st = NotifyState::default();
+        // total = 0（接口未返回总量）→ 按剩余百分比显示
+        let lines = quota_lines(&quota_snap(&[], Some((0, 0, 97.0))), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ MCP 月额度剩余 3%（低于 5%）"]);
+    }
+
+    #[test]
     fn diff_baseline_first_fetch_is_silent() {
         let mut st = NotifyState::default();
         assert!(diff_lines(&cards(&[(1, &expire_at(10.0), true)]), &mut st).is_empty());
@@ -606,7 +846,13 @@ mod tests {
             &cards(&[(1, &expire_at(10.0), true), (2, &expire_at(20.0), true)]),
             &mut st,
         );
-        assert_eq!(lines, vec!["🎁 5小时额度重置卡 +1（现有 2 张可用）"]);
+        assert_eq!(
+            lines,
+            vec![format!(
+                "🎁 新到 1 张 5小时额度重置卡，最早 {} 过期（现有 2 张可用）",
+                &expire_at(20.0)[5..16]
+            )]
+        );
         // 同一轮再查 → 静默
         assert!(diff_lines(
             &cards(&[(1, &expire_at(10.0), true), (2, &expire_at(20.0), true)]),
@@ -626,7 +872,7 @@ mod tests {
         let lines = diff_lines(&cards(&[(2, &expire_at(20.0), true)]), &mut st);
         assert_eq!(
             lines,
-            vec!["♻️ 5小时额度重置卡已使用 1 张（现有 1 张可用）"]
+            vec!["♻️ 5小时额度重置卡已使用 1 张，额度已重置（剩 1 张可用）"]
         );
     }
 
@@ -657,7 +903,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "♻️ 5小时额度重置卡已使用 1 张（现有 0 张可用）",
+                "♻️ 5小时额度重置卡已使用 1 张，额度已重置（剩 0 张可用）",
                 "⏰ 5小时额度重置卡过期作废 1 张",
             ]
         );
@@ -684,7 +930,13 @@ mod tests {
             &cards(&[(1, &expire_at(-0.1), true), (3, &expire_at(30.0), true)]),
             &mut st,
         );
-        assert_eq!(lines, vec!["🎁 5小时额度重置卡 +1（现有 2 张可用）"]);
+        assert_eq!(
+            lines,
+            vec![format!(
+                "🎁 新到 1 张 5小时额度重置卡，最早 {} 过期（现有 2 张可用）",
+                &expire_at(30.0)[5..16]
+            )]
+        );
     }
 
     #[test]
@@ -696,8 +948,11 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "♻️ 5小时额度重置卡已使用 1 张（现有 1 张可用）",
-                "🎁 5小时额度重置卡 +1（现有 1 张可用）",
+                "♻️ 5小时额度重置卡已使用 1 张，额度已重置（剩 1 张可用）".to_string(),
+                format!(
+                    "🎁 新到 1 张 5小时额度重置卡，最早 {} 过期（现有 1 张可用）",
+                    &expire_at(20.0)[5..16]
+                ),
             ]
         );
     }
@@ -731,6 +986,7 @@ mod tests {
             .insert("5h".into(), Some("2026-09-26 20:39:51".into()));
         st.last_reset.insert("week".into(), None);
         st.expire_alerted.insert(42, vec![24, 6]);
+        st.quota_alerted.insert("5小时额度".into(), vec![20.0, 5.0]);
         st.self_used.insert(99);
         let json = serde_json::to_string(&st).unwrap();
         let back: NotifyState = serde_json::from_str(&json).unwrap();

@@ -42,7 +42,7 @@ pub struct Config {
 }
 
 /// 重置卡提醒与通知渠道配置
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NotifyConfig {
     /// 系统桌面通知（Windows toast / macOS 通知中心 / Linux notify-send）
@@ -50,6 +50,11 @@ pub struct NotifyConfig {
     /// 重置卡到期提醒阈值（剩余小时数，≤ 该值时提醒一次；每张卡每档只提醒一次）。
     /// 空列表 = 关闭到期提醒
     pub expire_hours: Vec<u64>,
+    /// 额度耗尽提醒阈值（剩余百分比，≤ 该值时提醒一次；每类额度每档只提醒一次，
+    /// 额度重置后重新武装）。监控对象：5 小时 / 每周 Token 窗口 + MCP 月额度。
+    /// 例 [20, 10, 5, 1] → 剩余跌破 20% / 10% / 5% / 1% 时各提醒一次。
+    /// 空列表 = 关闭额度提醒
+    pub remain_pct: Vec<f64>,
     /// 群机器人 Webhook 地址（企微 / 飞书 / 钉钉，按域名自动识别机器人类型）。
     /// 识别规则：qyapi.weixin.qq.com → 企微；open.feishu.cn / open.larksuite.com → 飞书；
     /// oapi.dingtalk.com / api.dingtalk.com → 钉钉。留空 = 不发送
@@ -63,6 +68,7 @@ impl Default for NotifyConfig {
         Self {
             desktop: true,
             expire_hours: vec![24, 6, 1],
+            remain_pct: vec![20.0, 10.0, 5.0, 1.0],
             hook_url: String::new(),
             dingtalk_secret: String::new(),
         }
@@ -176,4 +182,40 @@ pub fn load() -> (Config, PathBuf) {
     }
 
     (cfg, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Config 其余必填字段（真实模板都会写入，此处补全以便只测 notify 段）
+    const BASE: &str = "api_key = 'k'\nbase_url = 'https://open.bigmodel.cn'\nmodel = 'm'\nmax_tokens = 8\ninterval_secs = 300\n";
+
+    /// README 示例写的是整数数组，TOML 整数须能反序列化为 Vec<f64>
+    #[test]
+    fn remain_pct_accepts_integer_array() {
+        let cfg: Config =
+            toml::from_str(&format!("{BASE}\n[notify]\nremain_pct = [20, 10, 5, 1]\n")).unwrap();
+        assert_eq!(cfg.notify.remain_pct, vec![20.0, 10.0, 5.0, 1.0]);
+    }
+
+    /// 旧版本配置缺 remain_pct → 自动补默认值，额度提醒对存量用户直接生效
+    #[test]
+    fn legacy_notify_section_gets_remain_pct_default() {
+        let cfg: Config = toml::from_str(&format!(
+            "{BASE}\n[notify]\nexpire_hours = [24]\nhook_url = 'x'\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.notify.remain_pct, vec![20.0, 10.0, 5.0, 1.0]);
+        assert_eq!(cfg.notify.expire_hours, vec![24]);
+        assert_eq!(cfg.notify.hook_url, "x");
+    }
+
+    /// 新用户首次生成的默认模板应包含 remain_pct
+    #[test]
+    fn default_template_contains_remain_pct() {
+        let t = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(t.contains("remain_pct"), "{t}");
+        assert!(t.contains("20.0") && t.contains("1.0"), "{t}");
+    }
 }

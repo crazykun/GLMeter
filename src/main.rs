@@ -327,8 +327,8 @@ fn postpone_until(
 fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>) {
     let cfg = config::load().0;
     let result = api::fetch_quota(client, &cfg);
-    // 作用域结束后立即释放状态锁：重置卡提醒可能联网发 webhook，不能卡住 UI 读状态
-    let resets = {
+    // 作用域结束后立即释放状态锁：提醒可能联网发 webhook，不能卡住 UI 读状态
+    let snapshot = {
         let mut ui = state.lock().unwrap();
         ui.cfg = cfg.clone();
         ui.busy = None;
@@ -343,12 +343,12 @@ fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>)
             Err(e) => ui::Status::Err(e),
         };
         match &ui.status {
-            ui::Status::Ok(s) => s.resets.clone(),
+            ui::Status::Ok(s) => Some(s.clone()),
             _ => None,
         }
     };
-    // 到期/新增提醒（含桌面通知与 webhook，内部自带去重状态）
-    notify::check(resets.as_ref(), &cfg);
+    // 额度耗尽/到期/新增提醒（含桌面通知与 webhook，内部自带去重状态）
+    notify::check(snapshot.as_ref(), &cfg);
 }
 
 /// 使用重置卡流程：选最早过期的可用卡 → 确认弹窗 → 调用接口 → 刷新额度
