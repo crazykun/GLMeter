@@ -198,6 +198,10 @@ MCP 月额度: 11/100 次（已用 11%）
 
 API Key 仅保存在本地配置文件中，本仓库不收集任何数据。
 
+## 相关项目
+
+- [glm-reset-card](https://github.com/crazykun/glm-reset-card) — Agent Skill：在 Claude Code / ZCode / Cursor 等编码助手里一句话使用 GLM 重置卡（查余额、优先消耗最早过期卡、确认后消耗，逻辑与 GLMeter 一致，并自动复用 GLMeter 的配置）
+
 ## 开发
 
 ```bash
