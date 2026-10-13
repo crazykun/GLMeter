@@ -590,10 +590,14 @@ B '确定' '' 356
 
 #[cfg(target_os = "macos")]
 fn show_about_macos() {
+    // display dialog 最多 3 按钮：三个链接占满后没有任何可见的关闭方式（只能 Esc），
+    // 故首选 NSAlert：3 链接 + 「确定」共 4 按钮
+    if show_about_macos_nsalert() {
+        return;
+    }
+    // 兜底：display dialog（3 链接，无独立「确定」，Esc 取消关闭）
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let text = format!("GLMeter v{}\nGLM Coding Plan 配额托盘监控工具", ui::VERSION);
-    // macOS 对话框最多 3 个按钮，无独立「确定」（Esc 关闭）；按钮顺序固定，
-    // 最右为默认（GLM 官网）
     let buttons = r#"buttons {"GitHub 地址", "GLM 注册", "GLM 官网"} default button "GLM 官网""#;
     let title = r#"with title "关于 GLMeter""#;
     let run_osascript = |script: String| {
@@ -631,6 +635,48 @@ fn show_about_macos() {
             about_open(String::from_utf8_lossy(&out.stdout).trim());
         }
     }
+}
+
+/// JXA + NSAlert：GitHub / 注册 / 官网 / 确定 4 按钮，点链接由 about_open 打开
+/// 浏览器，「确定」或 Esc 关闭。stdout 输出按钮文字供 about_open 匹配，
+/// 弹窗流程完整走完返回 true；osascript 不可用时返回 false 走兜底
+#[cfg(target_os = "macos")]
+fn show_about_macos_nsalert() -> bool {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let jxa = format!(
+        r#"ObjC.import('AppKit')
+const alert = $.NSAlert.alloc.init
+alert.messageText = 'GLMeter v{}'
+alert.informativeText = 'GLM Coding Plan 配额托盘监控工具'
+alert.addButtonWithTitle('GitHub 地址')
+alert.addButtonWithTitle('GLM 注册')
+alert.addButtonWithTitle('GLM 官网')
+alert.addButtonWithTitle('确定')
+const icon = $.NSImage.alloc.initWithContentsOfFile('{}')
+if (!icon.isNil()) alert.icon = icon
+// 首个按钮默认吃掉 Return（回车会直接开链接），摘掉；Esc 映射到「确定」
+alert.buttons.objectAtIndex(0).setKeyEquivalent('')
+alert.buttons.objectAtIndex(3).setKeyEquivalent(String.fromCharCode(27))
+$.NSApplication.sharedApplication
+// 托盘是后台进程，默认激活策略拿不到焦点，降为 accessory 后再抢前台
+$.NSApp.setActivationPolicy(1)
+$.NSApp.activateIgnoringOtherApps(true)
+const labels = ['GitHub 地址', 'GLM 注册', 'GLM 官网', '确定']
+const i = Number(alert.runModal) - 1000
+i >= 0 && i < labels.length ? labels[i] : ''"#,
+        ui::VERSION,
+        esc(&about_icon_path().display().to_string()),
+    );
+    if let Ok(out) = std::process::Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", &jxa])
+        .output()
+    {
+        if out.status.success() {
+            about_open(String::from_utf8_lossy(&out.stdout).trim());
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
