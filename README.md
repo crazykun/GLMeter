@@ -53,9 +53,13 @@ MCP 月额度 ██████████░░ 13/100 次
 
 ## 安装
 
-**Homebrew（macOS / Linux）：**
+**Homebrew（macOS 推荐 Cask，Linux / 纯命令行用 Formula）：**
 
 ```bash
+# macOS：安装 GLMeter.app 到 /Applications（菜单栏常驻，Launchpad/登录项可见）
+brew install --cask crazykun/ailater/glmeter
+
+# Linux（或 macOS 纯命令行场景）：仅命令行二进制
 brew install crazykun/ailater/glmeter
 ```
 
@@ -66,7 +70,7 @@ brew install crazykun/ailater/glmeter
 | Linux | `glmeter_<版本>_amd64.deb` | `sudo dpkg -i` 安装；二进制为 musl 静态链接，任何 x86_64 发行版可用 |
 | Linux | `glmeter-linux-x86_64.tar.gz` | 免安装，解压即用 |
 | macOS | `glmeter-macos-<arch>.dmg` | .app bundle，拖入 Applications；启动后常驻菜单栏 |
-| macOS | `glmeter-macos-<arch>.tar.gz` | 免安装（Homebrew 使用此格式） |
+| macOS | `glmeter-macos-<arch>.tar.gz` | 免安装（Homebrew Formula 使用此格式） |
 | Windows | `glmeter-<版本>-setup.exe` | Inno Setup 安装器，可选开机自启 |
 | Windows | `glmeter-windows-x86_64.zip` | 免安装，解压即用 |
 
