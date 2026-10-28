@@ -403,6 +403,10 @@ fn use_reset_card_flow(
             notify();
         }
         Err(e) => {
+            eprintln!(
+                "[GLMeter] 重置卡使用失败（{kind}，recordId={}，requestId={}）：{e}",
+                rec.record_id, request_id
+            );
             set_busy(state, Some(format!("{kind}重置卡使用失败: {e}")));
             notify();
         }
