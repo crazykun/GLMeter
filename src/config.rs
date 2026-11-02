@@ -97,7 +97,7 @@ impl Default for Config {
             base_url: "https://open.bigmodel.cn".into(),
             model: "glm-5.2".into(),
             max_tokens: 8,
-            interval_secs: 300,
+            interval_secs: 60,
             activate_at: Vec::new(),
             refresh_align: None,
             tray_title: default_tray_title(),
