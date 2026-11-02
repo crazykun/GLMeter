@@ -62,12 +62,13 @@ pub fn run(state: Arc<Mutex<UiState>>) {
     // ticker 自行重读配置，无需传入快照
     spawn_ticker(cmd_tx.clone());
 
-    // 初次构建菜单（结构指纹 + 句柄）
+    // 初次构建菜单（结构指纹 + 同源句柄）
     let (menu0, slots0, shape0) = {
         let guard = state.lock().unwrap();
         let entries = ui::menu_entries(&guard);
         let shape: Vec<u8> = entries.iter().map(|e| e.kind()).collect();
-        (build_menu(&entries), Slots::from_entries(&entries), shape)
+        let (menu, slots) = build_menu(&entries);
+        (menu, slots, shape)
     };
     let mut slots = Some((shape0, slots0));
 
@@ -121,21 +122,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
 
 struct Slots(Vec<MenuItem>);
 
-impl Slots {
-    fn from_entries(entries: &[ui::MenuEntry]) -> Self {
-        Self(
-            entries
-                .iter()
-                .filter_map(|e| match e {
-                    ui::MenuEntry::Info(_) | ui::MenuEntry::Button { .. } => Some(menu_item(e)),
-                    ui::MenuEntry::Separator => None,
-                })
-                .collect(),
-        )
-    }
-}
-
-/// 槽位顺序对应的文本：与 [`Slots::from_entries`] 同一过滤规则（跳过分隔线）
+/// 槽位顺序对应的文本：与 [`build_menu`] 建槽位同一过滤规则（跳过分隔线）
 fn slot_texts(entries: &[ui::MenuEntry]) -> Vec<&String> {
     entries
         .iter()
@@ -154,19 +141,27 @@ fn menu_item(e: &ui::MenuEntry) -> MenuItem {
     }
 }
 
-fn build_menu(entries: &[ui::MenuEntry]) -> Menu {
+/// 构建菜单并返回同源槽位：槽位句柄就是 append 进菜单的那批 MenuItem
+/// （共享同一 Rc<MenuChild>），原地 set_text 才能命中真实菜单。
+/// 此前槽位是 with_id 另建的独立克隆，其 parents_hemnu 为空，
+/// set_text 只改克隆自身——原生菜单永远收不到更新，表现为悬停 tooltip
+/// 正常、右键菜单停留在上次结构变化（busy/出错/重置卡行增减）时的旧数据。
+fn build_menu(entries: &[ui::MenuEntry]) -> (Menu, Slots) {
     let menu = Menu::new();
+    let mut slots = Vec::new();
     for e in entries {
         match e {
             ui::MenuEntry::Info(_) | ui::MenuEntry::Button { .. } => {
-                let _ = menu.append(&menu_item(e));
+                let item = menu_item(e);
+                let _ = menu.append(&item);
+                slots.push(item);
             }
             ui::MenuEntry::Separator => {
                 let _ = menu.append(&PredefinedMenuItem::separator());
             }
         }
     }
-    menu
+    (menu, Slots(slots))
 }
 
 fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc<Mutex<UiState>>) {
@@ -183,8 +178,9 @@ fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc
 
     let needs_rebuild = slots.as_ref().is_none_or(|(s, _)| *s != shape);
     if needs_rebuild {
-        tray.set_menu(Some(Box::new(build_menu(&entries))));
-        *slots = Some((shape, Slots::from_entries(&entries)));
+        let (menu, sl) = build_menu(&entries);
+        tray.set_menu(Some(Box::new(menu)));
+        *slots = Some((shape, sl));
     } else if let Some((_, sl)) = slots.as_ref() {
         // 槽位跳过了分隔线，配对时也必须按同一规则过滤，
         // 否则首个分隔线之后整体错位：紧跟分隔线的行永远不更新
@@ -233,28 +229,39 @@ mod tests {
         state
     }
 
-    /// 槽位（跳过分隔线的菜单句柄）与 slot_texts 必须按同一规则过滤，
-    /// 否则 render 原地 set_text 时首个分隔线之后整体错位、
-    /// 紧跟分隔线的行永远不更新（macOS/Windows 菜单"不刷新"的根因）
+    /// 槽位与菜单内条目必须共享存储：Slots 若是 with_id 另建的克隆
+    /// （parents_hemnu 为空），set_text 只改克隆自身、原生菜单永远收不到
+    /// 更新——表现为悬停 tooltip 正常、右键菜单停留在旧数据。
+    /// 同时覆盖配对规则：槽位与 slot_texts 按同一规则跳过分隔线。
+    /// macOS 的 muda::Menu::new 强制主线程（MainThreadMarker），测试线程会
+    /// panic，故仅在有 Win32/无此限制的平台运行（本模块本就不编译 Linux）。
     #[test]
-    fn slots_and_slot_texts_align_on_non_separator_entries() {
+    #[cfg(not(target_os = "macos"))]
+    fn slots_share_storage_with_built_menu_items() {
+        use tray_icon::menu::MenuItemKind;
+
         let entries = ui::menu_entries(&ok_state().lock().unwrap());
         assert!(entries.iter().any(|e| matches!(e, MenuEntry::Separator)));
 
-        let slots = Slots::from_entries(&entries);
+        let (menu, slots) = build_menu(&entries);
         let texts = slot_texts(&entries);
         assert_eq!(slots.0.len(), texts.len(), "槽位数与文本数必须一致");
 
-        let expected: Vec<&String> = entries
-            .iter()
-            .filter_map(|e| match e {
-                MenuEntry::Info(t) | MenuEntry::Button { text: t, .. } => Some(t),
-                MenuEntry::Separator => None,
-            })
-            .collect();
-        assert_eq!(texts, expected);
-        // 含数据的行（进度条）必须真的出现在槽位文本里，
-        // 旧实现的错位会让这一行配到 Separator 而被跳过
+        // 槽位 set_text 后，菜单内条目必须读到同样的文本；
+        // Windows 端 text() 实际走 GetMenuItemInfoW，能证明 HMENU 已更新
+        for (i, item) in slots.0.iter().enumerate() {
+            let probe = format!("PROBE#{i}");
+            item.set_text(&probe);
+            assert!(
+                menu.items().into_iter().any(|k| matches!(
+                    &k,
+                    MenuItemKind::MenuItem(mi) if mi.text() == probe
+                )),
+                "槽位 {i} 与菜单内条目不共享存储（原地 set_text 不生效的根因）"
+            );
+        }
+
+        // 含数据的行（进度条）必须真的出现在槽位文本里
         assert!(texts.iter().any(|t| t.contains("5小时额度")));
     }
 }
