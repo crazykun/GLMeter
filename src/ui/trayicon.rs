@@ -193,7 +193,7 @@ fn render(tray: &mut TrayIcon, slots: &mut Option<(Vec<u8>, Slots)>, state: &Arc
     tray.set_title(Some(&title));
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::api::{McpLimit, QuotaSnapshot, TokenWindow};
@@ -234,9 +234,8 @@ mod tests {
     /// 更新——表现为悬停 tooltip 正常、右键菜单停留在旧数据。
     /// 同时覆盖配对规则：槽位与 slot_texts 按同一规则跳过分隔线。
     /// macOS 的 muda::Menu::new 强制主线程（MainThreadMarker），测试线程会
-    /// panic，故仅在有 Win32/无此限制的平台运行（本模块本就不编译 Linux）。
+    /// panic，故整个测试模块在 macOS 也不编译（本模块本就不编译 Linux）。
     #[test]
-    #[cfg(not(target_os = "macos"))]
     fn slots_share_storage_with_built_menu_items() {
         use tray_icon::menu::MenuItemKind;
 
