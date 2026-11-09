@@ -1,4 +1,4 @@
-//! 本地网页设置页：菜单「⚙ 设置…」起一个只绑 127.0.0.1 的微型 HTTP 服务，
+//! 本地网页设置页：菜单「⚙ 设置」起一个只绑 127.0.0.1 的微型 HTTP 服务，
 //! 用浏览器打开随机令牌路径下的配置表单，替代手编 config.toml。
 //!
 //! 零依赖：HTTP 与表单解析手写、HTML/CSS 全部内联。安全模型：
@@ -149,14 +149,15 @@ fn handle_conn(mut stream: TcpStream, token: &str, cmd_tx: &Sender<Cmd>) {
         return;
     }
     let token_path = format!("/{token}");
-    let path_ok = path == token_path || path == format!("{token_path}/");
-    if !path_ok {
+    let is_form_path = path == token_path || path == format!("{token_path}/");
+    let is_test_path = path == format!("{token_path}/test-hook");
+    if !is_form_path && !is_test_path {
         respond(&mut stream, 404, "text/plain; charset=utf-8", "not found");
         return;
     }
 
     match method {
-        "GET" => {
+        "GET" if is_form_path => {
             let cfg = config::load().0;
             let page = render_form(&form_from_config(&cfg), &banners(), None);
             respond(&mut stream, 200, "text/html; charset=utf-8", &page);
@@ -188,6 +189,16 @@ fn handle_conn(mut stream: TcpStream, token: &str, cmd_tx: &Sender<Cmd>) {
                 }
             }
             let body = String::from_utf8_lossy(&body);
+            if is_test_path {
+                // webhook 测试：用表单当前值真实发送一条，不落盘、不发 Cmd
+                let hook = form_field(&body, "hook_url");
+                let secret = form_field(&body, "dingtalk_secret");
+                match notify::test_webhook(&hook, &secret) {
+                    Ok(msg) => respond(&mut stream, 200, "text/plain; charset=utf-8", &msg),
+                    Err(msg) => respond(&mut stream, 400, "text/plain; charset=utf-8", &msg),
+                }
+                return;
+            }
             match parse_form(&body) {
                 Ok(cfg) => match save_config(&cfg) {
                     Ok(()) => {
@@ -518,6 +529,16 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 从 urlencoded 体里取单个字段值（webhook 测试只关心个别字段，不走整表单校验）
+fn form_field(body: &str, key: &str) -> String {
+    body.split('&')
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| percent_decode(v))
+        })
+        .unwrap_or_default()
+}
+
 /// HTML 转义（表单值回显 / 错误信息内嵌）
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -617,6 +638,20 @@ mod tests {
         assert_eq!(v, vec!["20", "10", "5", "1", "0.5"]);
         let v: Vec<&str> = split_list(" , ; ").collect();
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn form_field_extracts_single_value() {
+        let body =
+            "hook_url=https%3A%2F%2Fqyapi.weixin.qq.com%2Fcgi-bin%2Fwebhook%2Fsend%3Fkey%3Dx\
+                    &dingtalk_secret=SECabc";
+        assert_eq!(
+            form_field(body, "hook_url"),
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x"
+        );
+        assert_eq!(form_field(body, "dingtalk_secret"), "SECabc");
+        assert_eq!(form_field(body, "missing"), "");
+        assert_eq!(form_field("", "hook_url"), "");
     }
 
     fn form_body() -> String {
@@ -785,6 +820,22 @@ mod tests {
         nulled = nulled.replacen("\r\n\r\n", "\r\nOrigin: null\r\n\r\n", 1);
         let resp = http(port, &nulled);
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", &resp[..40]);
+
+        // 6) webhook 测试端点 /{token}/test-hook：GET 405；空地址 400（离线，不发网络）
+        let resp = http(
+            port,
+            &format!("GET /{token}/test-hook HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 405"), "{}", &resp[..40]);
+        let mut test_req = post_req(port, &token, "hook_url=&dingtalk_secret=");
+        test_req = test_req.replacen(
+            &format!("POST /{token}/ "),
+            &format!("POST /{token}/test-hook "),
+            1,
+        );
+        let resp = http(port, &test_req);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", &resp[..40]);
+        assert!(resp.contains("地址为空"), "{}", &resp[..120]);
 
         let _ = std::fs::remove_file(&tmp);
     }

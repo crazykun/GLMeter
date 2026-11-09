@@ -199,7 +199,7 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
     });
     v.push(MenuEntry::Button {
         id: ID_SETTINGS,
-        text: "⚙ 设置…".into(),
+        text: "⚙ 设置".into(),
     });
     v.push(MenuEntry::Button {
         id: ID_CONFIG,

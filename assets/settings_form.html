@@ -29,12 +29,13 @@
   .warn, .err { padding: 8px 12px; border-radius: 7px; margin: 0 0 12px; }
   .warn { background: #fff7e0; border: 1px solid #e6c96a; color: #6b5300; }
   .err { background: #fdecec; border: 1px solid #e39a9a; color: #8c1d1d; }
-  #toast { position: fixed; left: 50%; bottom: 36px; transform: translateX(-50%) translateY(20px);
+  #toast { position: fixed; left: 50%; top: 24px; transform: translateX(-50%) translateY(-20px);
            padding: 10px 22px; border-radius: 9px; font-weight: 500; opacity: 0;
-           pointer-events: none; transition: all .25s ease; max-width: 90vw; z-index: 9; }
+           pointer-events: none; transition: all .25s ease; max-width: 90vw; z-index: 9;
+           box-shadow: 0 4px 18px #0003; }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-  #toast.ok  { background: #143d1e; color: #7fe0a2; box-shadow: 0 4px 18px #0003; }
-  #toast.bad { background: #451414; color: #f0a8a8; box-shadow: 0 4px 18px #0003; }
+  #toast.ok  { background: #143d1e; color: #7fe0a2; }
+  #toast.bad { background: #451414; color: #f0a8a8; }
   .save { text-align: center; margin: 20px 0 8px; }
   .save button { font: inherit; font-weight: 600; font-size: 15px; padding: 10px 56px;
                  border: 0; border-radius: 9px; background: #2f6fed; color: #fff; cursor: pointer; }
@@ -129,7 +130,11 @@ __BANNERS__
   <label for="expire_hours">重置卡到期提醒（剩余小时）</label>
   <input type="text" id="expire_hours" name="expire_hours" value="__EXPIRE__" placeholder="如 24, 6, 1，留空关闭">
   <label for="hook_url">群机器人 Webhook</label>
-  <input type="text" id="hook_url" name="hook_url" value="__HOOK__" placeholder="企微 / 飞书 / 钉钉地址，留空不发送">
+  <div class="flex">
+    <input type="text" id="hook_url" name="hook_url" value="__HOOK__" placeholder="企微 / 飞书 / 钉钉地址，留空不发送">
+    <button type="button" class="ghost" id="testhook" title="用下方当前填写的地址真实发送一条测试消息">发送测试</button>
+  </div>
+  <div class="hint">按当前填写内容测试（无需先保存）</div>
   <label for="dingtalk_secret">钉钉加签密钥</label>
   <input type="text" id="dingtalk_secret" name="dingtalk_secret" value="__SECRET__" placeholder="仅钉钉「加签」安全设置需要，其余平台留空">
 </fieldset>
@@ -176,6 +181,29 @@ __BANNERS__
         showToast('保存失败：无法连接设置服务（页面可能已过期，请从托盘重新打开）', 'bad');
         btn.textContent = '保存配置';
         btn.disabled = false;
+      });
+  });
+
+  var testBtn = document.getElementById('testhook');
+  testBtn.addEventListener('click', function () {
+    var body = new URLSearchParams({
+      hook_url: document.getElementById('hook_url').value,
+      dingtalk_secret: document.getElementById('dingtalk_secret').value
+    }).toString();
+    var old = testBtn.textContent;
+    testBtn.disabled = true;
+    testBtn.textContent = '发送中…';
+    fetch('test-hook', { method: 'POST', body: body })
+      .then(function (r) { return r.text().then(function (t) { return [r.ok, t]; }); })
+      .then(function (res) {
+        showToast((res[0] ? '✓ ' : '✗ ') + res[1], res[0] ? 'ok' : 'bad');
+        testBtn.textContent = old;
+        testBtn.disabled = false;
+      })
+      .catch(function () {
+        showToast('✗ 测试请求失败（服务可能已过期，请从托盘重新打开）', 'bad');
+        testBtn.textContent = old;
+        testBtn.disabled = false;
       });
   });
 })();

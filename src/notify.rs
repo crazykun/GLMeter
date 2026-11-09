@@ -525,17 +525,49 @@ impl Channel {
 }
 
 fn send_webhooks(cfg: &Config, title: &str, body: &str) {
-    let url = cfg.notify.hook_url.trim();
-    if url.is_empty() {
+    // 无 hook 是常态（静默）；dispatch_webhook 的其他错误记日志
+    if cfg.notify.hook_url.trim().is_empty() {
         return;
     }
+    let result = dispatch_webhook(
+        &cfg.notify.hook_url,
+        &cfg.notify.dingtalk_secret,
+        title,
+        body,
+    );
+    if let Err(e) = result {
+        eprintln!("[GLMeter] 群机器人通知发送失败: {e}");
+    }
+}
+
+/// 设置页「发送测试」：用表单当前值发一条测试消息，结果直接返回给页面
+pub(crate) fn test_webhook(hook_url: &str, dingtalk_secret: &str) -> Result<String, String> {
+    dispatch_webhook(
+        hook_url,
+        dingtalk_secret,
+        "GLMeter · 测试",
+        "这是一条设置页发出的测试消息，收到即配置有效。",
+    )
+}
+
+/// 识别渠道 → （钉钉加签）→ POST → 校验业务返回码。
+/// Ok 为人读的送达描述，Err 为失败原因（供日志与设置页测试共用）
+fn dispatch_webhook(
+    hook_url: &str,
+    secret: &str,
+    title: &str,
+    body: &str,
+) -> Result<String, String> {
+    let url = hook_url.trim();
+    if url.is_empty() {
+        return Err("Webhook 地址为空".into());
+    }
     let Some(channel) = Channel::detect(url) else {
-        eprintln!("[GLMeter] hook_url 域名无法识别机器人类型（支持企微/飞书/钉钉）: {url}");
-        return;
+        return Err("无法识别机器人类型（支持企微/飞书/钉钉域名）".into());
     };
     // 钉钉加签：安全设置选「加签」时必填 dingtalk_secret，其余平台忽略
     let url = if channel == Channel::DingTalk {
-        match cfg.notify.dingtalk_secret.trim() {
+        match secret.trim() {
             "" => url.to_string(),
             secret => dingtalk_signed(url, secret, &chrono::Utc::now()),
         }
@@ -545,8 +577,25 @@ fn send_webhooks(cfg: &Config, title: &str, body: &str) {
     // 以 GLMeter 开头：钉钉自定义关键词安全设置可直接用「GLMeter」
     let text = format!("【{title}】\n{body}");
     let client = reqwest::blocking::Client::new();
-    let payload = channel.payload(&text);
-    webhook_result(channel.label(), post_json(&client, &url, &payload));
+    let resp_body = post_json(&client, &url, &channel.payload(&text))?;
+    // 各平台返回码统一检查：errcode/code/StatusCode == 0 视为成功
+    let code = serde_json::from_str::<serde_json::Value>(&resp_body)
+        .ok()
+        .and_then(|v| {
+            v.get("errcode")
+                .or_else(|| v.get("code"))
+                .or_else(|| v.get("StatusCode"))
+                .and_then(|c| c.as_i64())
+        });
+    match code {
+        Some(0) => Ok(format!("测试消息已送达（{}）", channel.label())),
+        Some(_) => Err(format!(
+            "{}机器人拒绝: {}",
+            channel.label(),
+            truncate(&resp_body, 120)
+        )),
+        None => Ok(format!("已发送（{}，未识别返回码）", channel.label())),
+    }
 }
 
 fn post_json(
@@ -566,26 +615,6 @@ fn post_json(
         return Err(format!("HTTP {status}: {}", truncate(&body, 120)));
     }
     Ok(body)
-}
-
-/// 各平台返回码统一检查：errcode/code/StatusCode == 0 视为成功，否则记日志
-fn webhook_result(kind: &str, result: Result<String, String>) {
-    match result {
-        Err(e) => eprintln!("[GLMeter] {kind}通知发送失败: {e}"),
-        Ok(body) => {
-            let code = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.get("errcode")
-                        .or_else(|| v.get("code"))
-                        .or_else(|| v.get("StatusCode"))
-                        .and_then(|c| c.as_i64())
-                });
-            if code != Some(0) {
-                eprintln!("[GLMeter] {kind}通知被拒: {}", truncate(&body, 200));
-            }
-        }
-    }
 }
 
 /// 按字符数截断（直接按字节切会把中文切成非法 UTF-8 导致 panic）
