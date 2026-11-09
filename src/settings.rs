@@ -66,6 +66,7 @@ fn ensure_server(cmd_tx: Sender<Cmd>) -> Option<String> {
     });
 
     let url = format!("http://127.0.0.1:{port}/{token}/");
+    eprintln!("[GLMeter] 设置页已就绪: {url}");
     let _ = std::thread::Builder::new()
         .name("settings".into())
         .spawn(move || {
@@ -143,6 +144,7 @@ fn handle_conn(mut stream: TcpStream, token: &str, cmd_tx: &Sender<Cmd>) {
     }
     // DNS rebinding 防护：Host 必须是本机
     if !host_ok {
+        eprintln!("[GLMeter] 设置页 403：Host 头非本机（{path}）");
         respond(&mut stream, 403, "text/plain; charset=utf-8", "forbidden");
         return;
     }
@@ -160,9 +162,14 @@ fn handle_conn(mut stream: TcpStream, token: &str, cmd_tx: &Sender<Cmd>) {
             respond(&mut stream, 200, "text/html; charset=utf-8", &page);
         }
         "POST" => {
-            // 跨站伪造防护：浏览器 POST 会带 Origin；非本源一律拒绝
+            // 跨站伪造纵深防御：带明确异源 Origin 的 POST 拒绝。null/缺失放行——
+            // 令牌路径 128-bit 随机不可猜、页面 no-referrer 不外泄，token 才是
+            // 真正的 CSRF 门闸；且实测 Chrome 在部分环境（扩展改写请求头等）
+            // 会对同源表单 POST 发 Origin: null，一刀切会误伤真实用户
             if let Some(o) = &origin {
-                if !o.starts_with("http://127.0.0.1") && !o.starts_with("http://localhost") {
+                let local = o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost");
+                if !local && o != "null" {
+                    eprintln!("[GLMeter] 设置页 403：POST Origin 异常（{o}）");
                     respond(&mut stream, 403, "text/plain; charset=utf-8", "forbidden");
                     return;
                 }
@@ -759,6 +766,17 @@ mod tests {
             &format!("GET /{token}/ HTTP/1.1\r\nHost: evil.example.com\r\n\r\n"),
         );
         assert!(resp.starts_with("HTTP/1.1 403"));
+
+        // 5) Origin 策略：明确异源 403；null/缺失放行（Chrome 部分环境会对
+        //    同源表单 POST 发 null，token 才是真正的 CSRF 门闸）
+        let mut foreign = post_req(port, &token, body);
+        foreign = foreign.replacen("\r\n\r\n", "\r\nOrigin: http://evil.example.com\r\n\r\n", 1);
+        let resp = http(port, &foreign);
+        assert!(resp.starts_with("HTTP/1.1 403"), "{}", &resp[..40]);
+        let mut nulled = post_req(port, &token, body);
+        nulled = nulled.replacen("\r\n\r\n", "\r\nOrigin: null\r\n\r\n", 1);
+        let resp = http(port, &nulled);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", &resp[..40]);
 
         let _ = std::fs::remove_file(&tmp);
     }
