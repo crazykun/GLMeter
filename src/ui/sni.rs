@@ -7,7 +7,7 @@
 
 use super::{
     UiState, ID_ABOUT, ID_ACTIVATE, ID_CHECK_UPDATE, ID_CONFIG, ID_REFRESH, ID_RESET_SITE,
-    ID_USE_RESET_5H, ID_USE_RESET_WEEK, ID_VIEW_UPDATE,
+    ID_SETTINGS, ID_USE_RESET_5H, ID_USE_RESET_WEEK, ID_VIEW_UPDATE,
 };
 use crate::ui;
 use crate::{spawn_ticker, spawn_worker, Cmd};
@@ -75,6 +75,7 @@ impl Tray for GlmTray {
                             let cmd = match id {
                                 ID_ACTIVATE => Cmd::Activate { scheduled: false },
                                 ID_REFRESH => Cmd::Fetch,
+                                ID_SETTINGS => Cmd::Settings,
                                 ID_CONFIG => Cmd::OpenConfig,
                                 ID_ABOUT => Cmd::About,
                                 ID_USE_RESET_5H => Cmd::UseResetCard { week: false },

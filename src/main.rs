@@ -6,6 +6,7 @@ mod api;
 mod autocard;
 mod config;
 mod notify;
+mod settings;
 mod ui;
 
 #[cfg(target_os = "linux")]
@@ -30,6 +31,8 @@ pub enum Cmd {
         week: bool,
     },
     OpenConfig,
+    /// 打开本地网页设置页（127.0.0.1 随机令牌表单，编辑并保存配置）
+    Settings,
     /// 弹出关于窗口（版本 + 官网用量 / 邀请注册 / GitHub 入口）
     About,
     /// 检查更新（manual = 菜单点击，显示 busy 与结果；auto = 定时静默检查）
@@ -207,6 +210,7 @@ pub fn spawn_worker(
                     let path = state.lock().unwrap().cfg_path.clone();
                     open_config(&path);
                 }
+                Cmd::Settings => settings::open(cmd_tx.clone()),
                 Cmd::OpenResetSite => open_url(ui::USAGE_SITE_URL),
                 Cmd::About => show_about(),
                 Cmd::CheckUpdate { manual } => {

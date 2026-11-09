@@ -19,6 +19,7 @@ pub const ID_ACTIVATE: &str = "activate";
 pub const ID_REFRESH: &str = "refresh";
 pub const ID_CHECK_UPDATE: &str = "check_update";
 pub const ID_VIEW_UPDATE: &str = "view_update";
+pub const ID_SETTINGS: &str = "settings";
 pub const ID_CONFIG: &str = "config";
 pub const ID_ABOUT: &str = "about";
 pub const ID_QUIT: &str = "quit";
@@ -197,8 +198,12 @@ pub fn menu_entries(state: &UiState) -> Vec<MenuEntry> {
         text: format!("↻ 立即刷新{refreshed_at}"),
     });
     v.push(MenuEntry::Button {
+        id: ID_SETTINGS,
+        text: "⚙ 设置…".into(),
+    });
+    v.push(MenuEntry::Button {
         id: ID_CONFIG,
-        text: "⚙ 打开配置文件".into(),
+        text: "📝 打开配置文件".into(),
     });
     // 更新 / 关于 / 退出：独立分组
     v.push(MenuEntry::Separator);

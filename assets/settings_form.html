@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>GLMeter 设置</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.6 system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 680px; margin: 0 auto; padding: 16px; color: #1c1e21; background: #f6f7f9; }
+  h1 { font-size: 18px; margin: 8px 0 14px; }
+  fieldset { border: 1px solid #d4d7dd; border-radius: 10px; margin: 0 0 16px; padding: 10px 16px 14px; }
+  legend { font-weight: 600; padding: 0 6px; }
+  label { display: block; margin: 12px 0 4px; font-weight: 500; }
+  .checkline { display: flex; align-items: center; gap: 7px; margin: 8px 0 2px; font-weight: 500; }
+  .checkline input { width: auto; }
+  .hint { color: #8a8f99; font-size: 12px; margin-top: 3px; font-weight: 400; }
+  input[type=text], input[type=password], input[type=number] {
+    width: 100%; padding: 7px 10px; border: 1px solid #c2c6cd; border-radius: 7px;
+    font: inherit; background: #fff; color: inherit; }
+  input:focus { outline: 2px solid #2f6fed44; border-color: #2f6fed; }
+  .row { display: flex; gap: 14px; } .row > div { flex: 1; min-width: 0; }
+  .flex { display: flex; gap: 8px; } .flex input { flex: 1; }
+  .ghost { font: inherit; padding: 6px 14px; border: 1px solid #c2c6cd; border-radius: 7px;
+           background: transparent; color: inherit; cursor: pointer; }
+  .warn, .err { padding: 8px 12px; border-radius: 7px; margin: 0 0 12px; }
+  .warn { background: #fff7e0; border: 1px solid #e6c96a; color: #6b5300; }
+  .err { background: #fdecec; border: 1px solid #e39a9a; color: #8c1d1d; }
+  .save { text-align: center; margin: 20px 0 8px; }
+  .save button { font: inherit; font-weight: 600; font-size: 15px; padding: 10px 56px;
+                 border: 0; border-radius: 9px; background: #2f6fed; color: #fff; cursor: pointer; }
+  .save button:hover { background: #265cd0; }
+  .foot { text-align: center; color: #8a8f99; font-size: 12px; margin-top: 18px; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6e6e8; background: #17181c; }
+    fieldset { border-color: #34363d; }
+    input[type=text], input[type=password], input[type=number] { background: #212329; border-color: #43454d; }
+    .ghost { border-color: #43454d; }
+    .warn { background: #3a3010; border-color: #7a6a1e; color: #e8d48a; }
+    .err { background: #3c1a1a; border-color: #7a3636; color: #f0a8a8; }
+  }
+</style>
+</head>
+<body>
+<h1>GLMeter 设置</h1>
+__ERROR__
+__BANNERS__
+<form method="post" action="">
+
+<fieldset>
+<legend>账号</legend>
+  <label for="api_key">API Key</label>
+  <div class="flex">
+    <input type="password" id="api_key" name="api_key" value="__API_KEY__" autocomplete="off" spellcheck="false">
+    <button type="button" class="ghost" onclick="var e=document.getElementById('api_key');e.type=e.type==='password'?'text':'password'">显示</button>
+  </div>
+  <div class="hint">智谱开放平台 / Z.ai 的 Key（id.secret 格式），留空 = 未配置</div>
+
+  <label for="base_url">接口地址</label>
+  <input type="text" id="base_url" name="base_url" value="__BASE_URL__" list="urls" spellcheck="false">
+  <datalist id="urls">
+    <option value="https://open.bigmodel.cn"></option>
+    <option value="https://api.z.ai"></option>
+  </datalist>
+  <div class="hint">国内 open.bigmodel.cn · 国际 api.z.ai</div>
+
+  <div class="row">
+    <div>
+      <label for="model">模型</label>
+      <input type="text" id="model" name="model" value="__MODEL__" spellcheck="false">
+      <div class="hint">激活请求所用模型</div>
+    </div>
+    <div>
+      <label for="max_tokens">max_tokens</label>
+      <input type="number" id="max_tokens" name="max_tokens" value="__MAX_TOKENS__" min="1">
+      <div class="hint">激活请求的 max_tokens</div>
+    </div>
+  </div>
+</fieldset>
+
+<fieldset>
+<legend>刷新</legend>
+  <div class="row">
+    <div>
+      <label for="interval_secs">刷新间隔（秒）</label>
+      <input type="number" id="interval_secs" name="interval_secs" value="__INTERVAL__" min="60" max="86400">
+      <div class="hint">最小 60 秒</div>
+    </div>
+    <div>
+      <label for="refresh_align">间隔对齐起点</label>
+      <input type="text" id="refresh_align" name="refresh_align" value="__ALIGN__" placeholder="HH:MM，留空滚动计时">
+      <div class="hint">如 00:00 → 从整点起对齐网格</div>
+    </div>
+  </div>
+</fieldset>
+
+<fieldset>
+<legend>激活</legend>
+  <label class="checkline"><input type="checkbox" name="auto_activate" __AUTO_ACTIVATE__> auto 激活（窗口未激活 / 重置时间一到就激活）</label>
+  <label for="activate_at">每天定点激活</label>
+  <input type="text" id="activate_at" name="activate_at" value="__ACTIVATE_AT__" placeholder="如 09:00, 14:00，留空关闭">
+  <label for="auto_use_reset_card">自动用卡阈值（剩余 %）</label>
+  <input type="number" id="auto_use_reset_card" name="auto_use_reset_card" value="__AUTO_USE__" min="0" max="100" step="0.1">
+  <div class="hint">0 = 关闭；存在 2 小时内过期的重置卡且 5 小时额度剩余低于该值时，自动使用最早过期的一张</div>
+</fieldset>
+
+<fieldset>
+<legend>托盘</legend>
+  <label for="tray_title">托盘文字模板</label>
+  <input type="text" id="tray_title" name="tray_title" value="__TRAY_TITLE__" placeholder="GLM {5h_left}%">
+  <div class="hint">变量：{level} {5h_used} {5h_left} {5h_reset} {5h_countdown} {weekly_used} {weekly_left} {mcp_used} {mcp_total} {mcp_left}</div>
+</fieldset>
+
+<fieldset>
+<legend>提醒</legend>
+  <label class="checkline"><input type="checkbox" name="desktop" __DESKTOP__> 系统桌面通知</label>
+  <label for="remain_pct">额度提醒阈值（剩余 %）</label>
+  <input type="text" id="remain_pct" name="remain_pct" value="__REMAIN__" placeholder="如 20, 10, 5, 1，留空关闭">
+  <div class="hint">剩余跌破各档时提醒一次，额度重置后重新武装</div>
+  <label for="expire_hours">重置卡到期提醒（剩余小时）</label>
+  <input type="text" id="expire_hours" name="expire_hours" value="__EXPIRE__" placeholder="如 24, 6, 1，留空关闭">
+  <label for="hook_url">群机器人 Webhook</label>
+  <input type="text" id="hook_url" name="hook_url" value="__HOOK__" placeholder="企微 / 飞书 / 钉钉地址，留空不发送">
+  <label for="dingtalk_secret">钉钉加签密钥</label>
+  <input type="text" id="dingtalk_secret" name="dingtalk_secret" value="__SECRET__" placeholder="仅钉钉「加签」安全设置需要，其余平台留空">
+</fieldset>
+
+<div class="save"><button type="submit">保存配置</button></div>
+</form>
+<div class="foot">保存写入配置文件，托盘下一轮刷新（≤ 60 秒）内生效 · 本页面 15 分钟后失效</div>
+</body>
+</html>

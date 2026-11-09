@@ -97,6 +97,7 @@ pub fn run(state: Arc<Mutex<UiState>>) {
                     let cmd = match id.as_str() {
                         ui::ID_ACTIVATE => Cmd::Activate { scheduled: false },
                         ui::ID_REFRESH => Cmd::Fetch,
+                        ui::ID_SETTINGS => Cmd::Settings,
                         ui::ID_CONFIG => Cmd::OpenConfig,
                         ui::ID_ABOUT => Cmd::About,
                         ui::ID_USE_RESET_5H => Cmd::UseResetCard { week: false },
