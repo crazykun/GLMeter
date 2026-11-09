@@ -403,7 +403,7 @@ pub(crate) fn parse_expire(s: &str) -> Option<chrono::DateTime<Local>> {
 // ── 桌面通知（各平台原生，与 confirm_dialog 同样的「外调命令」风格）────────
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn send_desktop(title: &str, body: &str) {
+pub(crate) fn send_desktop(title: &str, body: &str) {
     let ok = std::process::Command::new("notify-send")
         .args(["-a", "GLMeter"])
         .arg(title)
@@ -417,7 +417,7 @@ fn send_desktop(title: &str, body: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn send_desktop(title: &str, body: &str) {
+pub(crate) fn send_desktop(title: &str, body: &str) {
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
@@ -436,7 +436,7 @@ fn send_desktop(title: &str, body: &str) {
 }
 
 #[cfg(target_os = "windows")]
-fn send_desktop(title: &str, body: &str) {
+pub(crate) fn send_desktop(title: &str, body: &str) {
     use base64::Engine;
     use std::os::windows::process::CommandExt;
 

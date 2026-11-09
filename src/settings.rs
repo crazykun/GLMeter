@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::api;
 use crate::config::{self, Config};
-use crate::{open_url, Cmd};
+use crate::{notify, open_url, Cmd};
 
 /// 服务生命周期：到期自动关闭，再次点菜单会起新实例（换新令牌）
 const SERVER_LIFETIME: Duration = Duration::from_secs(15 * 60);
@@ -193,6 +193,14 @@ fn handle_conn(mut stream: TcpStream, token: &str, cmd_tx: &Sender<Cmd>) {
                     Ok(()) => {
                         // 保存成功，让托盘立即按新配置刷新
                         let _ = cmd_tx.send(Cmd::Fetch);
+                        // 桌面 toast 反馈（跟随桌面通知开关，不发 webhook）：
+                        // 浏览器端 JS 无跳转留表单，这里补一个系统级提示
+                        if cfg.notify.desktop {
+                            notify::send_desktop(
+                                "GLMeter · 设置已保存",
+                                "配置已写入，托盘下一轮刷新内生效",
+                            );
+                        }
                         let page = include_str!("../assets/settings_saved.html")
                             .replace("__BACK__", &token_path);
                         respond(&mut stream, 200, "text/html; charset=utf-8", &page);
