@@ -93,6 +93,8 @@ fn serve(
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // 对端连上即断（macOS 上 accept 会以 ConnectionAborted 上抛）：跳过即可
+            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
             Err(e) => {
                 eprintln!("[GLMeter] 设置页 accept 失败: {e}");
                 return;
@@ -103,6 +105,9 @@ fn serve(
 
 /// 处理单个连接：解析请求行/头/体，路由到表单页或保存
 fn handle_conn(mut stream: TcpStream, token: &str, cmd_tx: &Sender<Cmd>) {
+    // macOS/BSD 的 accept 会继承 listener 的 nonblocking 状态，读会立刻
+    // WouldBlock 导致连接被静默丢弃——显式恢复阻塞模式（Linux/Windows 为 no-op）
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut head: Vec<u8> = Vec::new();
     let mut buf = [0u8; 2048];
@@ -735,6 +740,11 @@ mod tests {
         out
     }
 
+    /// 断言消息用：取响应前 n 字符（空响应时不越界 panic，露出真实断言）
+    fn head(s: &str, n: usize) -> String {
+        s.get(..n).unwrap_or(s).to_string()
+    }
+
     fn post_req(port: u16, token: &str, body: &str) -> String {
         format!(
             "POST /{token}/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
@@ -765,7 +775,7 @@ mod tests {
             port,
             &format!("GET /{token}/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
         );
-        assert!(page.starts_with("HTTP/1.1 200 OK"), "{}", &page[..40]);
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{}", head(&page, 40));
         assert!(page.contains("GLMeter 设置"));
         assert!(page.contains("保存配置"));
 
@@ -773,7 +783,7 @@ mod tests {
         let body = "api_key=k&base_url=https%3A%2F%2Fopen.bigmodel.cn&model=m&max_tokens=8\
                     &interval_secs=120&auto_use_reset_card=0&tray_title=E2E&remain_pct=&expire_hours=";
         let resp = http(port, &post_req(port, &token, body));
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", &resp[..40]);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", head(&resp, 40));
         assert!(resp.contains("已保存"));
         let saved = std::fs::read_to_string(&tmp).unwrap();
         assert!(saved.contains("tray_title = \"E2E\""), "{saved}");
@@ -792,7 +802,7 @@ mod tests {
         // 3) POST 非法值：400 + 错误信息 + 文件未被改动
         let bad = body.replace("interval_secs=120", "interval_secs=5");
         let resp = http(port, &post_req(port, &token, &bad));
-        assert!(resp.starts_with("HTTP/1.1 400"), "{}", &resp[..40]);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", head(&resp, 40));
         assert!(resp.contains("60"));
         assert!(std::fs::read_to_string(&tmp)
             .unwrap()
@@ -815,18 +825,18 @@ mod tests {
         let mut foreign = post_req(port, &token, body);
         foreign = foreign.replacen("\r\n\r\n", "\r\nOrigin: http://evil.example.com\r\n\r\n", 1);
         let resp = http(port, &foreign);
-        assert!(resp.starts_with("HTTP/1.1 403"), "{}", &resp[..40]);
+        assert!(resp.starts_with("HTTP/1.1 403"), "{}", head(&resp, 40));
         let mut nulled = post_req(port, &token, body);
         nulled = nulled.replacen("\r\n\r\n", "\r\nOrigin: null\r\n\r\n", 1);
         let resp = http(port, &nulled);
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", &resp[..40]);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", head(&resp, 40));
 
         // 6) webhook 测试端点 /{token}/test-hook：GET 405；空地址 400（离线，不发网络）
         let resp = http(
             port,
             &format!("GET /{token}/test-hook HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
         );
-        assert!(resp.starts_with("HTTP/1.1 405"), "{}", &resp[..40]);
+        assert!(resp.starts_with("HTTP/1.1 405"), "{}", head(&resp, 40));
         let mut test_req = post_req(port, &token, "hook_url=&dingtalk_secret=");
         test_req = test_req.replacen(
             &format!("POST /{token}/ "),
@@ -834,8 +844,8 @@ mod tests {
             1,
         );
         let resp = http(port, &test_req);
-        assert!(resp.starts_with("HTTP/1.1 400"), "{}", &resp[..40]);
-        assert!(resp.contains("地址为空"), "{}", &resp[..120]);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", head(&resp, 40));
+        assert!(resp.contains("地址为空"), "{}", head(&resp, 120));
 
         let _ = std::fs::remove_file(&tmp);
     }
