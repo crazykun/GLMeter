@@ -154,7 +154,9 @@ __BANNERS__
     e.preventDefault();                       // 不跳转：留表单 + 系统桌面 toast
     btn.disabled = true;
     btn.textContent = '保存中…';
-    fetch(form.action || location.href, { method: 'POST', body: new FormData(form) })
+    // URLSearchParams 强制 urlencoded（FormData 会发 multipart，服务端只解析 urlencoded）
+    fetch(form.action || location.href,
+          { method: 'POST', body: new URLSearchParams(new FormData(form)).toString() })
       .then(function (resp) {
         if (resp.ok) {
           showToast('✓ 已保存，托盘下一轮刷新内生效', 'ok');

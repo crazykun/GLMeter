@@ -801,5 +801,8 @@ mod tests {
         // 横幅位：无错误时也应填入（可为空），不留占位符残留
         assert!(!page.contains("__BANNERS__"));
         assert!(!page.contains("__ERROR__"));
+        // 编码契约：前端必须以 urlencoded 提交（服务端 parse_form 只解析该格式；
+        // 曾因 FormData 发 multipart 导致全部字段解析失败）
+        assert!(page.contains("URLSearchParams"));
     }
 }
