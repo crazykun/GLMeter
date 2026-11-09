@@ -393,7 +393,7 @@ pub fn mark_self_used(record_id: i64) {
 
 /// 服务端过期时间字符串（"2026-10-01 23:59:59"，官网按北京时间展示）按本机时区解析；
 /// 国内用户本机时区即北京时间，与官网显示一致
-fn parse_expire(s: &str) -> Option<chrono::DateTime<Local>> {
+pub(crate) fn parse_expire(s: &str) -> Option<chrono::DateTime<Local>> {
     use chrono::TimeZone;
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .ok()

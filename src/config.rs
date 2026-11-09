@@ -36,6 +36,10 @@ pub struct Config {
     /// 以触发 5h 窗口统计并获取 nextResetTime
     #[serde(default = "default_auto_activate")]
     pub auto_activate: bool,
+    /// 自动用卡（0 = 关闭）：存在 2 小时内过期的重置卡、且 5 小时额度剩余
+    /// 低于该百分比时，自动使用最早过期的一张（不限类型）。例：5 = 剩余 <5% 时自动用卡
+    #[serde(default)]
+    pub auto_use_reset_card: f64,
     /// 通知设置（[notify] 段，旧配置可整体省略）
     #[serde(default)]
     pub notify: NotifyConfig,
@@ -102,6 +106,7 @@ impl Default for Config {
             refresh_align: None,
             tray_title: default_tray_title(),
             auto_activate: default_auto_activate(),
+            auto_use_reset_card: 0.0,
             notify: NotifyConfig::default(),
         }
     }
@@ -217,5 +222,14 @@ mod tests {
         let t = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(t.contains("remain_pct"), "{t}");
         assert!(t.contains("20.0") && t.contains("1.0"), "{t}");
+    }
+
+    /// 旧版本配置缺 auto_use_reset_card → 自动补 0（关闭），存量用户不被自动用卡
+    #[test]
+    fn legacy_config_auto_use_reset_card_defaults_off() {
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert_eq!(cfg.auto_use_reset_card, 0.0);
+        let cfg: Config = toml::from_str(&format!("{BASE}\nauto_use_reset_card = 5\n")).unwrap();
+        assert_eq!(cfg.auto_use_reset_card, 5.0);
     }
 }

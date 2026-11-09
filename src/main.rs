@@ -3,6 +3,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod api;
+mod autocard;
 mod config;
 mod notify;
 mod ui;
@@ -349,6 +350,10 @@ fn worker_fetch(client: &reqwest::blocking::Client, state: &Arc<Mutex<UiState>>)
     };
     // 额度耗尽/到期/新增提醒（含桌面通知与 webhook，内部自带去重状态）
     notify::check(snapshot.as_ref(), &cfg);
+    // 自动用卡：存在 2h 内过期的重置卡且 5h 额度低于阈值时静默用卡（内部自带退避）
+    if let Some(snap) = snapshot.as_ref() {
+        autocard::maybe_auto_use(client, state, snap, &cfg);
+    }
 }
 
 /// 使用重置卡流程：选最早过期的可用卡 → 确认弹窗 → 调用接口 → 刷新额度
