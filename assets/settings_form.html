@@ -18,9 +18,10 @@
   .checkline { display: flex; align-items: center; gap: 7px; margin: 8px 0 2px; font-weight: 500; }
   .checkline input { width: auto; }
   .hint { color: #8a8f99; font-size: 12px; margin-top: 3px; font-weight: 400; }
-  input[type=text], input[type=password], input[type=number] {
+  input[type=text], input[type=password], input[type=number], select {
     width: 100%; padding: 7px 10px; border: 1px solid #c2c6cd; border-radius: 7px;
     font: inherit; background: #fff; color: inherit; }
+  #base_sel { flex: 0 0 210px; cursor: pointer; }
   input:focus { outline: 2px solid #2f6fed44; border-color: #2f6fed; }
   .row { display: flex; gap: 14px; } .row > div { flex: 1; min-width: 0; }
   .flex { display: flex; gap: 8px; } .flex input { flex: 1; }
@@ -44,7 +45,7 @@
   @media (prefers-color-scheme: dark) {
     body { color: #e6e6e8; background: #17181c; }
     fieldset { border-color: #34363d; }
-    input[type=text], input[type=password], input[type=number] { background: #212329; border-color: #43454d; }
+    input[type=text], input[type=password], input[type=number], select { background: #212329; border-color: #43454d; }
     .ghost { border-color: #43454d; }
     .warn { background: #3a3010; border-color: #7a6a1e; color: #e8d48a; }
     .err { background: #3c1a1a; border-color: #7a3636; color: #f0a8a8; }
@@ -67,12 +68,15 @@ __BANNERS__
   <div class="hint">智谱开放平台 / Z.ai 的 Key（id.secret 格式），留空 = 未配置</div>
 
   <label for="base_url">接口地址</label>
-  <input type="text" id="base_url" name="base_url" value="__BASE_URL__" list="urls" spellcheck="false">
-  <datalist id="urls">
-    <option value="https://open.bigmodel.cn"></option>
-    <option value="https://api.z.ai"></option>
-  </datalist>
-  <div class="hint">国内 open.bigmodel.cn · 国际 api.z.ai</div>
+  <div class="flex">
+    <select id="base_sel">
+      <option value="https://open.bigmodel.cn">国内 open.bigmodel.cn</option>
+      <option value="https://api.z.ai">国际 api.z.ai</option>
+      <option value="">自定义…</option>
+    </select>
+    <input type="text" id="base_url" name="base_url" value="__BASE_URL__" spellcheck="false" placeholder="https://…">
+  </div>
+  <div class="hint">下拉选预设，或选「自定义…」手填地址</div>
 
   <div class="row">
     <div>
@@ -185,6 +189,26 @@ __BANNERS__
   });
 
   var testBtn = document.getElementById('testhook');
+  // 接口地址：下拉选预设填入，选「自定义…」就地编辑；输入框手动改动时回同步下拉态
+  var baseSel = document.getElementById('base_sel');
+  var baseUrl = document.getElementById('base_url');
+  function syncBaseSel() {
+    var v = baseUrl.value.trim().replace(/\/+$/, '');
+    var hit = Array.prototype.some.call(baseSel.options, function (o) {
+      return o.value && o.value === v;
+    });
+    baseSel.value = hit ? v : '';
+  }
+  baseSel.addEventListener('change', function () {
+    if (baseSel.value) {
+      baseUrl.value = baseSel.value;
+    } else {
+      baseUrl.focus();
+      baseUrl.select();
+    }
+  });
+  baseUrl.addEventListener('input', syncBaseSel);
+  syncBaseSel();
   testBtn.addEventListener('click', function () {
     var body = new URLSearchParams({
       hook_url: document.getElementById('hook_url').value,
