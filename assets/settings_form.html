@@ -18,10 +18,18 @@
   .checkline { display: flex; align-items: center; gap: 7px; margin: 8px 0 2px; font-weight: 500; }
   .checkline input { width: auto; }
   .hint { color: #8a8f99; font-size: 12px; margin-top: 3px; font-weight: 400; }
-  input[type=text], input[type=password], input[type=number], select {
+  input[type=text], input[type=password], input[type=number], input[type=time], select {
     width: 100%; padding: 7px 10px; border: 1px solid #c2c6cd; border-radius: 7px;
     font: inherit; background: #fff; color: inherit; }
   #base_sel { flex: 0 0 210px; cursor: pointer; }
+  #time_pick { flex: 1; cursor: pointer; }
+  .times { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 8px; }
+  .times:empty { display: none; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; background: #e8eefc; color: #1d4ed8;
+          border-radius: 6px; padding: 3px 5px 3px 10px; font-weight: 500; }
+  .chipx { border: 0; background: transparent; color: inherit; cursor: pointer;
+           font-size: 15px; line-height: 1; padding: 0 3px; }
+  .chipx:hover { color: #b91c1c; }
   input:focus { outline: 2px solid #2f6fed44; border-color: #2f6fed; }
   .row { display: flex; gap: 14px; } .row > div { flex: 1; min-width: 0; }
   .flex { display: flex; gap: 8px; } .flex input { flex: 1; }
@@ -45,7 +53,8 @@
   @media (prefers-color-scheme: dark) {
     body { color: #e6e6e8; background: #17181c; }
     fieldset { border-color: #34363d; }
-    input[type=text], input[type=password], input[type=number], select { background: #212329; border-color: #43454d; }
+    input[type=text], input[type=password], input[type=number], input[type=time], select { background: #212329; border-color: #43454d; }
+    .chip { background: #1e2a47; color: #93b4f7; }
     .ghost { border-color: #43454d; }
     .warn { background: #3a3010; border-color: #7a6a1e; color: #e8d48a; }
     .err { background: #3c1a1a; border-color: #7a3636; color: #f0a8a8; }
@@ -111,8 +120,14 @@ __BANNERS__
 <fieldset>
 <legend>激活</legend>
   <label class="checkline"><input type="checkbox" name="auto_activate" __AUTO_ACTIVATE__> auto 激活（窗口未激活 / 重置时间一到就激活）</label>
-  <label for="activate_at">每天定点激活</label>
-  <input type="text" id="activate_at" name="activate_at" value="__ACTIVATE_AT__" placeholder="如 09:00, 14:00，留空关闭">
+  <label for="time_pick">每天定点激活</label>
+  <div class="times" id="times_box"></div>
+  <div class="flex">
+    <input type="time" id="time_pick">
+    <button type="button" class="ghost" id="time_add">＋ 添加</button>
+  </div>
+  <input type="hidden" name="activate_at" id="activate_at" value="__ACTIVATE_AT__">
+  <div class="hint">每天在这些时刻自动发送激活请求；点标签上的 × 删除，留空 = 不定点激活</div>
   <label for="auto_use_reset_card">自动用卡阈值（剩余 %）</label>
   <input type="number" id="auto_use_reset_card" name="auto_use_reset_card" value="__AUTO_USE__" min="0" max="100" step="0.1">
   <div class="hint">0 = 关闭；存在 2 小时内过期的重置卡且 5 小时额度剩余低于该值时，自动使用最早过期的一张</div>
@@ -189,6 +204,54 @@ __BANNERS__
   });
 
   var testBtn = document.getElementById('testhook');
+  // 定点激活时刻：chips 编辑（添加/删除），真实值同步进 hidden 的 activate_at
+  var actList = [], actHidden = document.getElementById('activate_at'),
+      actBox = document.getElementById('times_box');
+  function parseHM(s) {
+    var m = s.trim().match(/^(\d{1,2}):(\d{1,2})$/);
+    if (!m) return null;
+    var h = +m[1], mi = +m[2];
+    return (h > 23 || mi > 59) ? null : h * 60 + mi;
+  }
+  function fmtHM(mins) {
+    var h = Math.floor(mins / 60), m = mins % 60;
+    return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+  }
+  function renderTimes() {
+    actBox.innerHTML = '';
+    actList.forEach(function (mins, i) {
+      var chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = fmtHM(mins);
+      var x = document.createElement('button');
+      x.type = 'button'; x.className = 'chipx'; x.textContent = '×';
+      x.title = '删除 ' + fmtHM(mins);
+      x.onclick = function () { actList.splice(i, 1); syncTimes(); };
+      chip.appendChild(x);
+      actBox.appendChild(chip);
+    });
+    if (!actList.length) {
+      var e = document.createElement('span');
+      e.className = 'hint'; e.textContent = '（未设置，每天不定点激活）';
+      actBox.appendChild(e);
+    }
+  }
+  function syncTimes() {
+    actList.sort(function (a, b) { return a - b; });
+    actHidden.value = actList.map(fmtHM).join(', ');
+    renderTimes();
+  }
+  document.getElementById('time_add').addEventListener('click', function () {
+    var mins = parseHM(document.getElementById('time_pick').value || '');
+    if (mins === null) { showToast('请先在左侧选一个时刻', 'bad'); return; }
+    if (actList.indexOf(mins) >= 0) { return; }   // 已存在：静默去重
+    actList.push(mins);
+    syncTimes();
+  });
+  actList = actHidden.value.split(/[,，]/).map(parseHM)
+    .filter(function (x) { return x !== null; })
+    .filter(function (v, i, a) { return a.indexOf(v) === i; });
+  syncTimes();
   // 接口地址：下拉选预设填入，选「自定义…」就地编辑；输入框手动改动时回同步下拉态
   var baseSel = document.getElementById('base_sel');
   var baseUrl = document.getElementById('base_url');
