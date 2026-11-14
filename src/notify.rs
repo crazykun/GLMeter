@@ -113,6 +113,19 @@ pub fn check(snapshot: Option<&QuotaSnapshot>, cfg: &Config) {
     send_webhooks(cfg, title, &body);
 }
 
+/// 一类待检查的额度（Token 窗口或 MCP 月额度）
+struct QuotaItem<'a> {
+    /// 去重键 / 展示名
+    key: &'a str,
+    /// 剩余百分比
+    remaining: f64,
+    /// 剩余量文案（窗口为百分比，MCP 为「次」）
+    remain_text: String,
+    /// 窗口是否已激活（未激活时服务端不返回重置时间）
+    activated: bool,
+    next_reset: Option<chrono::DateTime<Local>>,
+}
+
 /// 额度耗尽提醒：5 小时 / 每周 Token 窗口与 MCP 月额度的剩余跌破配置阈值
 /// （remain_pct，剩余百分比）时各提醒一次，每类每档只提醒一次；同一轮跨过
 /// 多个档位只按最紧急的一档提醒，其余档位一并标记已提醒。额度重置（剩余
@@ -133,16 +146,19 @@ fn quota_lines(snap: &QuotaSnapshot, n: &NotifyConfig, st: &mut NotifyState) -> 
     }
     let max_threshold = thresholds[0];
 
-    // (类型, 剩余百分比, 剩余量文案)；去重键用窗口 label（parse_quota 硬编码，稳定）
-    let mut items: Vec<(&str, f64, String)> = snap
+    // 去重键用窗口 label（parse_quota 硬编码，稳定）
+    let mut items: Vec<QuotaItem<'_>> = snap
         .windows
         .iter()
         .map(|w| {
-            (
-                w.label.as_str(),
-                (100.0 - w.used_pct).clamp(0.0, 100.0),
-                format!("{}%", fmt_pct((100.0 - w.used_pct).clamp(0.0, 100.0))),
-            )
+            let remaining = (100.0 - w.used_pct).clamp(0.0, 100.0);
+            QuotaItem {
+                key: w.label.as_str(),
+                remaining,
+                remain_text: format!("{}%", fmt_pct(remaining)),
+                activated: w.activated,
+                next_reset: w.next_reset,
+            }
         })
         .collect();
     if let Some(m) = &snap.mcp {
@@ -152,11 +168,24 @@ fn quota_lines(snap: &QuotaSnapshot, n: &NotifyConfig, st: &mut NotifyState) -> 
         } else {
             format!("{}%", fmt_pct(remaining_pct))
         };
-        items.push(("MCP 月额度", remaining_pct, remain_text));
+        items.push(QuotaItem {
+            key: "MCP 月额度",
+            remaining: remaining_pct,
+            remain_text,
+            activated: true,
+            next_reset: m.next_reset,
+        });
     }
 
     let mut lines = Vec::new();
-    for (key, remaining, remain_text) in items {
+    for it in items {
+        let QuotaItem {
+            key,
+            remaining,
+            remain_text,
+            activated,
+            next_reset,
+        } = it;
         if remaining > max_threshold {
             // 已重置/回升到所有阈值之上 → 重新武装
             st.quota_alerted.remove(key);
@@ -178,7 +207,10 @@ fn quota_lines(snap: &QuotaSnapshot, n: &NotifyConfig, st: &mut NotifyState) -> 
         } else {
             format!("低于 {}%", fmt_pct(urgent))
         };
-        lines.push(format!("⚠ {key}剩余 {remain_text}（{why}）"));
+        lines.push(format!(
+            "⚠ {key}剩余 {remain_text}（{why}）{}",
+            reset_hint(activated, next_reset)
+        ));
     }
     // 阈值配置缩水（如删掉某档）时同步收缩已提醒记录，防止无限增长
     for alerted in st.quota_alerted.values_mut() {
@@ -195,6 +227,27 @@ fn fmt_pct(v: f64) -> String {
     } else {
         format!("{v:.1}")
     }
+}
+
+/// 低额度提醒后面的「何时恢复」补充文案（固定句子，独立于阈值说明）：
+/// - 有下次重置时间 → "，将于 今天 00:26 重置（2小时30分后）"
+/// - 重置时刻已过（服务端尚未刷新）→ "，即将重置"（不再拼倒计时，避免出现「即将重置后」）
+/// - 窗口未激活（还没发起过请求，服务端不返回重置时间）→ "（额度未激活）"
+/// - 其余（接口没给时间）→ 空串，保持原样不画蛇添足
+fn reset_hint(activated: bool, next_reset: Option<chrono::DateTime<Local>>) -> String {
+    let Some(dt) = next_reset else {
+        return if activated {
+            String::new()
+        } else {
+            "（额度未激活）".to_string()
+        };
+    };
+    // countdown 在 ≤0 时返回 COUNTDOWN_SOON，此时它已是完整句子，不再套「…后」
+    let cd = crate::ui::countdown(&dt);
+    if cd == crate::ui::COUNTDOWN_SOON {
+        return "，即将重置".to_string();
+    }
+    format!("，将于 {} 重置（{}后）", crate::ui::fmt_reset(&dt), cd)
 }
 
 /// 到期提醒：找出本轮新跌破阈值的卡，按「类型+最紧急档位」分组，每组一行。
@@ -712,6 +765,19 @@ mod tests {
         }
     }
 
+    /// 带下次重置时间的额度快照：next_reset 用「N 分钟后」构造，便于断言倒计时文案
+    fn quota_snap_at(used_pct: f64, activated: bool, reset_in_mins: Option<i64>) -> QuotaSnapshot {
+        QuotaSnapshot {
+            windows: vec![TokenWindow {
+                label: "5小时额度".into(),
+                used_pct,
+                activated,
+                next_reset: reset_in_mins.map(|m| Local::now() + Duration::minutes(m)),
+            }],
+            ..quota_snap(&[], None)
+        }
+    }
+
     #[test]
     fn expire_alerts_fire_once_per_level() {
         let n = notify_cfg(&[24, 6, 1]);
@@ -846,6 +912,67 @@ mod tests {
         let n = quota_cfg(&[20.0, 150.0]);
         let lines = quota_lines(&quota_snap(&[85.0], None), &n, &mut st);
         assert_eq!(lines, vec!["⚠ 5小时额度剩余 15%（低于 20%）"]);
+    }
+
+    /// 低额度提醒要带上「何时恢复」：下次重置时刻 + 倒计时
+    #[test]
+    fn quota_line_appends_next_reset_time() {
+        let n = quota_cfg(&[20.0]);
+        let mut st = NotifyState::default();
+        // 剩余 15%，2 小时 30 分后重置
+        let lines = quota_lines(&quota_snap_at(85.0, true, Some(150)), &n, &mut st);
+        assert_eq!(lines.len(), 1);
+        let l = &lines[0];
+        assert!(
+            l.starts_with("⚠ 5小时额度剩余 15%（低于 20%），将于 "),
+            "{l}"
+        );
+        // 时刻取 fmt_reset、倒计时取 countdown，两者都在同一行且以「后）」收尾
+        assert!(l.ends_with("后）"), "{l}");
+        // 只看小时位：分钟数会因用例跨分钟边界抖动（2小时30分 → 2小时29分）
+        assert!(l.contains("2小时") && l.contains("分后"), "{l}");
+    }
+
+    /// 窗口未激活时服务端不给重置时间，提示改为「额度未激活」，不再编造时刻
+    #[test]
+    fn quota_line_marks_inactive_window() {
+        let n = quota_cfg(&[20.0]);
+        let mut st = NotifyState::default();
+        let lines = quota_lines(&quota_snap_at(85.0, false, None), &n, &mut st);
+        assert_eq!(lines, vec!["⚠ 5小时额度剩余 15%（低于 20%）（额度未激活）"]);
+    }
+
+    /// MCP 月额度的重置时间同样带上
+    #[test]
+    fn quota_mcp_line_appends_next_reset_time() {
+        let n = quota_cfg(&[20.0]);
+        let mut st = NotifyState::default();
+        let reset = Local::now() + Duration::minutes(45);
+        let mut snap = quota_snap(&[], Some((92, 100, 92.0)));
+        snap.mcp.as_mut().unwrap().next_reset = Some(reset);
+        let lines = quota_lines(&snap, &n, &mut st);
+        assert_eq!(lines.len(), 1);
+        let l = &lines[0];
+        assert!(
+            l.starts_with("⚠ MCP 月额度剩余 8/100 次（低于 20%），将于 "),
+            "{l}"
+        );
+        assert!(l.ends_with("后）"), "{l}");
+        // 同上：不写死分钟数，跨分钟边界会抖动
+        assert!(l.contains("分后"), "{l}");
+    }
+
+    /// 重置时间早于当前（服务端未及时刷新）→ 不拼倒计时，直接「即将重置」，
+    /// 避免出现「即将重置后」这种病句，也不出现负数
+    #[test]
+    fn quota_countdown_never_negative() {
+        let n = quota_cfg(&[20.0]);
+        let mut st = NotifyState::default();
+        let lines = quota_lines(&quota_snap_at(85.0, true, Some(-5)), &n, &mut st);
+        let l = &lines[0];
+        assert!(l.ends_with("，即将重置"), "{l}");
+        assert!(!l.contains("后）"), "{l}");
+        assert!(!l.contains('-'), "{l}");
     }
 
     #[test]

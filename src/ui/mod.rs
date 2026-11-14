@@ -449,7 +449,9 @@ fn level_text(s: &QuotaSnapshot) -> String {
         .unwrap_or_default()
 }
 
-fn fmt_reset(dt: &DateTime<Local>) -> String {
+/// 下次重置时刻的短文案（"今天 00:26" / "明天 08:00" / "11-20 08:00"）。
+/// 菜单、悬停提示与提醒文案共用，保证同一时刻表述一致
+pub(crate) fn fmt_reset(dt: &DateTime<Local>) -> String {
     let now = Local::now();
     let hm = dt.format("%H:%M");
     match dt.date_naive() - now.date_naive() {
@@ -459,10 +461,15 @@ fn fmt_reset(dt: &DateTime<Local>) -> String {
     }
 }
 
-fn countdown(to: &DateTime<Local>) -> String {
+/// countdown 的兜底文案（重置时刻已过），notify 侧需据此判断要不要再套「…后」
+pub(crate) const COUNTDOWN_SOON: &str = "即将重置";
+
+/// 距下次重置的倒计时粗粒度文案（"2小时30分" / "45分" / "即将重置"）。
+/// 与 fmt_reset 一样供菜单与提醒共用
+pub(crate) fn countdown(to: &DateTime<Local>) -> String {
     let mins = (*to - Local::now()).num_minutes();
     if mins <= 0 {
-        "即将重置".into()
+        COUNTDOWN_SOON.into()
     } else if mins >= 60 {
         format!("{}小时{:02}分", mins / 60, mins % 60)
     } else {
