@@ -29,6 +29,13 @@ ksni = { version = "0.3", default-features = false, features = ["blocking", "asy
 tray-icon = "0.24"
 tao = "0.37"
 
+# macOS: 原生通知中心（通知归属与点击回调，不再借道 Script Editor）
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSError", "NSObject", "NSString"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "UNUserNotificationCenter", "block2"] }
+
 # exe 图标资源嵌入（build.rs 仅在 Windows 目标时实际生效）
 [build-dependencies]
 winresource = "0.1"

@@ -16,6 +16,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+#[path = "notify_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::init as init_desktop;
+
 /// 一张可用卡的跟踪信息（减少时用于归因）
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct TrackedCard {
@@ -471,21 +477,7 @@ pub(crate) fn send_desktop(title: &str, body: &str) {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn send_desktop(title: &str, body: &str) {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(
-        "display notification \"{}\" with title \"{}\"",
-        esc(body),
-        esc(title)
-    );
-    let ok = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        eprintln!("[GLMeter] 桌面通知失败（osascript 不可用）");
-    }
+    macos::send(title, body);
 }
 
 #[cfg(target_os = "windows")]
